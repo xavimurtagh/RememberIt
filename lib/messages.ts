@@ -16,6 +16,7 @@ export interface GetTranscriptMessage {
 export interface GenerateFlashcardsMessage {
   type: 'GENERATE_FLASHCARDS';
   transcript: string;
+  segments: TranscriptSegment[];
   videoTitle: string;
   channel: string;
   cardCount: number;
@@ -56,6 +57,7 @@ export interface TranscriptResponse {
 export interface FlashcardResponse {
   success: boolean;
   flashcards?: GeneratedFlashcard[];
+  backend?: 'chrome-ai' | 'rule-based';
   error?: string;
 }
 

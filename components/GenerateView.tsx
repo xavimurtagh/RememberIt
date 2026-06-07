@@ -1,15 +1,14 @@
 import { useState, useEffect } from 'react';
-import { v4 as uuidv4 } from 'uuid';
 import { saveVideo, saveCards, getVideoWithCards } from '@/lib/database';
 import { createCardFromFlashcard } from '@/lib/scheduler';
 import type {
   VideoMetadata,
   GeneratedFlashcard,
   Video,
-  Settings,
+  TranscriptSegment,
 } from '@/lib/types';
-import { DEFAULT_SETTINGS } from '@/lib/types';
 import type { TranscriptResponse, FlashcardResponse } from '@/lib/messages';
+import type { AIBackend } from '@/lib/ai';
 
 interface Props {
   currentVideo: VideoMetadata | null;
@@ -27,6 +26,7 @@ export default function GenerateView({ currentVideo, onSaved }: Props) {
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [alreadyHasCards, setAlreadyHasCards] = useState(false);
   const [transcript, setTranscript] = useState('');
+  const [backend, setBackend] = useState<AIBackend | null>(null);
 
   useEffect(() => {
     if (currentVideo) {
@@ -60,6 +60,7 @@ export default function GenerateView({ currentVideo, onSaved }: Props) {
     setLoading(true);
     setError('');
     setFlashcards([]);
+    setBackend(null);
 
     try {
       setStatus('Extracting transcript...');
@@ -68,7 +69,7 @@ export default function GenerateView({ currentVideo, onSaved }: Props) {
         videoId: vid,
       });
 
-      if (!transcriptRes.success || !transcriptRes.fullText) {
+      if (!transcriptRes.success || !transcriptRes.fullText || !transcriptRes.segments) {
         throw new Error(transcriptRes.error || 'Failed to extract transcript');
       }
 
@@ -82,10 +83,11 @@ export default function GenerateView({ currentVideo, onSaved }: Props) {
       };
       setMetadata(meta);
 
-      setStatus('Generating flashcards with AI...');
+      setStatus('Generating flashcards...');
       const flashcardRes: FlashcardResponse = await browser.runtime.sendMessage({
         type: 'GENERATE_FLASHCARDS',
         transcript: transcriptRes.fullText,
+        segments: transcriptRes.segments,
         videoTitle: meta.title,
         channel: meta.channel,
         cardCount,
@@ -96,6 +98,7 @@ export default function GenerateView({ currentVideo, onSaved }: Props) {
       }
 
       setFlashcards(flashcardRes.flashcards);
+      setBackend(flashcardRes.backend || null);
       setStatus('');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'An error occurred');
@@ -129,6 +132,7 @@ export default function GenerateView({ currentVideo, onSaved }: Props) {
 
     setFlashcards([]);
     setStatus('');
+    setBackend(null);
     onSaved();
   }
 
@@ -208,6 +212,11 @@ export default function GenerateView({ currentVideo, onSaved }: Props) {
           >
             {loading ? status || 'Processing...' : 'Generate Flashcards'}
           </button>
+
+          <p className="text-xs text-gray-400 text-center">
+            Uses Chrome's built-in AI when available, otherwise extracts key points automatically.
+            No API key needed — completely free.
+          </p>
         </>
       )}
 
@@ -220,9 +229,18 @@ export default function GenerateView({ currentVideo, onSaved }: Props) {
       {flashcards.length > 0 && (
         <>
           <div className="flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-gray-700">
-              {flashcards.length} Cards Generated
-            </h3>
+            <div>
+              <h3 className="text-sm font-semibold text-gray-700">
+                {flashcards.length} Cards Generated
+              </h3>
+              {backend && (
+                <span className="text-xs text-gray-400">
+                  {backend === 'chrome-ai'
+                    ? 'Generated with Chrome AI (on-device)'
+                    : 'Generated with smart extraction (edit cards to improve)'}
+                </span>
+              )}
+            </div>
             <button
               onClick={handleSave}
               className="bg-indigo-600 text-white px-4 py-1.5 rounded-lg text-sm font-medium hover:bg-indigo-700 transition-colors"
@@ -230,6 +248,14 @@ export default function GenerateView({ currentVideo, onSaved }: Props) {
               Save to Library
             </button>
           </div>
+
+          {backend === 'rule-based' && (
+            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-700">
+              Cards were generated using key-point extraction. We recommend editing the
+              questions to better match what you want to remember. Chrome AI (available in
+              Chrome 138+) produces higher-quality cards automatically.
+            </div>
+          )}
 
           <div className="space-y-3">
             {flashcards.map((fc, i) => (

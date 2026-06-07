@@ -54,7 +54,6 @@ export interface ReviewLog {
 }
 
 export interface Settings {
-  apiKey: string;
   targetRetention: number;
   defaultCardCount: number;
   theme: 'light' | 'dark' | 'system';
@@ -64,7 +63,6 @@ export interface Settings {
 }
 
 export const DEFAULT_SETTINGS: Settings = {
-  apiKey: '',
   targetRetention: 0.9,
   defaultCardCount: 10,
   theme: 'system',

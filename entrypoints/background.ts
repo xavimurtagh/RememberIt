@@ -7,8 +7,6 @@ import type {
   FlashcardResponse,
   DueCountResponse,
 } from '@/lib/messages';
-import type { Settings } from '@/lib/types';
-import { DEFAULT_SETTINGS } from '@/lib/types';
 
 export default defineBackground(() => {
   updateBadge();
@@ -55,21 +53,14 @@ async function handleMessage(
     }
     case 'GENERATE_FLASHCARDS': {
       try {
-        const settings = await getSettings();
-        if (!settings.apiKey) {
-          return {
-            success: false,
-            error: 'No API key configured. Please add your Claude API key in Settings.',
-          };
-        }
-        const flashcards = await generateFlashcards(
-          settings.apiKey,
+        const { flashcards, backend } = await generateFlashcards(
           message.transcript,
           message.videoTitle,
           message.channel,
-          message.cardCount
+          message.cardCount,
+          message.segments
         );
-        return { success: true, flashcards };
+        return { success: true, flashcards, backend };
       } catch (e) {
         return {
           success: false,
@@ -87,11 +78,6 @@ async function handleMessage(
     default:
       return;
   }
-}
-
-async function getSettings(): Promise<Settings> {
-  const result = await browser.storage.local.get('settings');
-  return { ...DEFAULT_SETTINGS, ...(result.settings || {}) };
 }
 
 async function updateBadge(): Promise<void> {

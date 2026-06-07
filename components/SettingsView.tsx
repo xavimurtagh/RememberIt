@@ -2,14 +2,16 @@ import { useState, useEffect } from 'react';
 import type { Settings } from '@/lib/types';
 import { DEFAULT_SETTINGS } from '@/lib/types';
 import { db } from '@/lib/database';
+import { checkChromeAIAvailability } from '@/lib/ai';
 
 export default function SettingsView() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [saved, setSaved] = useState(false);
-  const [showKey, setShowKey] = useState(false);
+  const [aiStatus, setAiStatus] = useState<'checking' | 'available' | 'unavailable'>('checking');
 
   useEffect(() => {
     loadSettings();
+    checkAI();
   }, []);
 
   async function loadSettings() {
@@ -17,6 +19,11 @@ export default function SettingsView() {
     if (result.settings) {
       setSettings({ ...DEFAULT_SETTINGS, ...result.settings });
     }
+  }
+
+  async function checkAI() {
+    const available = await checkChromeAIAvailability();
+    setAiStatus(available ? 'available' : 'unavailable');
   }
 
   async function handleSave() {
@@ -75,31 +82,32 @@ export default function SettingsView() {
   return (
     <div className="p-4 space-y-5">
       <div>
-        <h3 className="text-sm font-semibold text-gray-700 mb-2">AI Configuration</h3>
-        <div className="bg-white rounded-lg border border-gray-200 p-3 space-y-3">
-          <div>
-            <label className="block text-xs text-gray-600 mb-1">
-              Claude API Key
-            </label>
-            <div className="flex gap-2">
-              <input
-                type={showKey ? 'text' : 'password'}
-                value={settings.apiKey}
-                onChange={(e) => updateSetting('apiKey', e.target.value)}
-                placeholder="sk-ant-..."
-                className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              />
-              <button
-                onClick={() => setShowKey(!showKey)}
-                className="px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-600 hover:bg-gray-50"
-              >
-                {showKey ? 'Hide' : 'Show'}
-              </button>
+        <h3 className="text-sm font-semibold text-gray-700 mb-2">AI Status</h3>
+        <div className="bg-white rounded-lg border border-gray-200 p-3">
+          {aiStatus === 'checking' ? (
+            <div className="text-sm text-gray-500">Checking Chrome AI availability...</div>
+          ) : aiStatus === 'available' ? (
+            <div className="flex items-center gap-2">
+              <span className="w-2.5 h-2.5 bg-green-500 rounded-full" />
+              <div>
+                <div className="text-sm font-medium text-green-700">Chrome AI Available</div>
+                <div className="text-xs text-gray-500">
+                  Flashcards will be generated on-device using Gemini Nano. Free and private.
+                </div>
+              </div>
             </div>
-            <p className="text-xs text-gray-400 mt-1">
-              Get your key from console.anthropic.com. Stored locally only.
-            </p>
-          </div>
+          ) : (
+            <div className="flex items-center gap-2">
+              <span className="w-2.5 h-2.5 bg-amber-400 rounded-full" />
+              <div>
+                <div className="text-sm font-medium text-amber-700">Chrome AI Not Available</div>
+                <div className="text-xs text-gray-500">
+                  Using smart key-point extraction (rule-based). Cards may need manual editing.
+                  For AI-powered cards, update to Chrome 138+ and enable built-in AI.
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 

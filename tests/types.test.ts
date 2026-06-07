@@ -4,7 +4,6 @@ import { DEFAULT_SETTINGS } from '@/lib/types';
 describe('Types and Constants', () => {
   describe('DEFAULT_SETTINGS', () => {
     it('has sensible default values', () => {
-      expect(DEFAULT_SETTINGS.apiKey).toBe('');
       expect(DEFAULT_SETTINGS.targetRetention).toBe(0.9);
       expect(DEFAULT_SETTINGS.defaultCardCount).toBe(10);
       expect(DEFAULT_SETTINGS.theme).toBe('system');

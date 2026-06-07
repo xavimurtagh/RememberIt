@@ -13,7 +13,6 @@ export default defineConfig({
     },
     host_permissions: [
       'https://www.youtube.com/*',
-      'https://api.anthropic.com/*',
     ],
   },
   vite: () => ({
