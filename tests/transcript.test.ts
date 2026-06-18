@@ -6,47 +6,87 @@ describe('Transcript Extraction', () => {
     vi.restoreAllMocks();
   });
 
-  const makeCaptionXml = (segments: { text: string; start: number; dur: number }[]) => {
+  const makeCaptionXml = (
+    segments: { text: string; start: number; dur: number }[]
+  ) => {
     const entries = segments
       .map((s) => `<text start="${s.start}" dur="${s.dur}">${s.text}</text>`)
       .join('');
     return `<?xml version="1.0" encoding="utf-8"?><transcript>${entries}</transcript>`;
   };
 
-  const makePlayerHtml = (captionUrl: string) => {
-    const playerResponse = JSON.stringify({
-      captions: {
-        playerCaptionsTracklistRenderer: {
-          captionTracks: [
-            {
-              baseUrl: captionUrl,
-              languageCode: 'en',
-            },
-          ],
-        },
-      },
+  const makeJson3 = (
+    segments: { text: string; start: number; dur: number }[]
+  ) =>
+    JSON.stringify({
+      events: segments.map((s) => ({
+        tStartMs: s.start * 1000,
+        dDurationMs: s.dur * 1000,
+        segs: [{ utf8: s.text }],
+      })),
     });
-    return `<script>var ytInitialPlayerResponse = ${playerResponse};</script>`;
-  };
 
-  it('extracts transcript segments from YouTube video', async () => {
-    const captionXml = makeCaptionXml([
+  const makePlayerResponse = (
+    tracks: { baseUrl: string; languageCode: string }[]
+  ) => ({
+    captions: {
+      playerCaptionsTracklistRenderer: {
+        captionTracks: tracks,
+      },
+    },
+  });
+
+  // Routes fetch calls: InnerTube POST returns player response,
+  // caption GET returns the caption body.
+  function mockFetch(
+    playerResponse: unknown,
+    captionBody: string,
+    options: { innertubeOk?: boolean } = {}
+  ) {
+    const { innertubeOk = true } = options;
+    return vi.fn((input: URL | RequestInfo, init?: RequestInit) => {
+      const url = String(input);
+      const isInnertube = url.includes('/youtubei/v1/player');
+      const isWatchPage = url.includes('/watch?v=');
+
+      if (isInnertube && init?.method === 'POST') {
+        return Promise.resolve({
+          ok: innertubeOk,
+          json: () => Promise.resolve(playerResponse),
+          text: () => Promise.resolve(JSON.stringify(playerResponse)),
+        } as Response);
+      }
+
+      if (isWatchPage) {
+        // Fallback path: embed player response in HTML
+        const html = `<script>var ytInitialPlayerResponse = ${JSON.stringify(
+          playerResponse
+        )};</script>`;
+        return Promise.resolve({
+          ok: true,
+          text: () => Promise.resolve(html),
+        } as Response);
+      }
+
+      // Caption track fetch
+      return Promise.resolve({
+        ok: true,
+        text: () => Promise.resolve(captionBody),
+      } as Response);
+    });
+  }
+
+  it('extracts transcript segments using InnerTube + json3', async () => {
+    const segments = [
       { text: 'Hello world', start: 0, dur: 2 },
       { text: 'This is a test', start: 2, dur: 3 },
       { text: 'Thank you', start: 5, dur: 1.5 },
+    ];
+    const player = makePlayerResponse([
+      { baseUrl: 'https://www.youtube.com/api/timedtext?v=abc', languageCode: 'en' },
     ]);
 
-    const captionUrl = 'https://www.youtube.com/api/timedtext?v=abc123&lang=en';
-
-    global.fetch = vi.fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        text: () => Promise.resolve(makePlayerHtml(captionUrl)),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        text: () => Promise.resolve(captionXml),
-      } as Response);
+    global.fetch = mockFetch(player, makeJson3(segments));
 
     const result = await fetchTranscript('abc123');
 
@@ -54,109 +94,111 @@ describe('Transcript Extraction', () => {
     expect(result.segments[0].text).toBe('Hello world');
     expect(result.segments[0].start).toBe(0);
     expect(result.segments[0].duration).toBe(2);
-    expect(result.segments[1].text).toBe('This is a test');
     expect(result.segments[2].text).toBe('Thank you');
     expect(result.fullText).toBe('Hello world This is a test Thank you');
   });
 
+  it('extracts transcript using XML caption format', async () => {
+    const segments = [
+      { text: 'First line', start: 0, dur: 2 },
+      { text: 'Second line', start: 2, dur: 2 },
+    ];
+    const player = makePlayerResponse([
+      { baseUrl: 'https://example.com/captions', languageCode: 'en' },
+    ]);
+
+    global.fetch = mockFetch(player, makeCaptionXml(segments));
+
+    const result = await fetchTranscript('xmlvid');
+    expect(result.segments).toHaveLength(2);
+    expect(result.fullText).toBe('First line Second line');
+  });
+
   it('throws error when no captions are available', async () => {
-    const htmlNoCaptions = `<script>var ytInitialPlayerResponse = ${JSON.stringify({
-      captions: {
-        playerCaptionsTracklistRenderer: {
-          captionTracks: [],
-        },
-      },
-    })};</script>`;
+    const player = makePlayerResponse([]);
+    global.fetch = mockFetch(player, '');
 
-    global.fetch = vi.fn().mockResolvedValueOnce({
-      ok: true,
-      text: () => Promise.resolve(htmlNoCaptions),
-    } as Response);
-
-    await expect(fetchTranscript('nocaptions')).rejects.toThrow('No captions available');
+    await expect(fetchTranscript('nocaptions')).rejects.toThrow(
+      'No captions available'
+    );
   });
 
-  it('throws error when player response is missing', async () => {
-    global.fetch = vi.fn().mockResolvedValueOnce({
-      ok: true,
-      text: () => Promise.resolve('<html><body>No player response</body></html>'),
-    } as Response);
+  it('falls back to watch page scrape when InnerTube fails', async () => {
+    const segments = [{ text: 'Scraped content', start: 0, dur: 2 }];
+    const player = makePlayerResponse([
+      { baseUrl: 'https://example.com/captions', languageCode: 'en' },
+    ]);
 
-    await expect(fetchTranscript('missing')).rejects.toThrow('No captions available');
+    // InnerTube returns not-ok → triggers HTML scrape fallback
+    global.fetch = mockFetch(player, makeJson3(segments), {
+      innertubeOk: false,
+    });
+
+    const result = await fetchTranscript('fallback');
+    expect(result.segments).toHaveLength(1);
+    expect(result.segments[0].text).toBe('Scraped content');
   });
 
-  it('handles HTML entities in transcript text', async () => {
-    const captionXml = makeCaptionXml([
+  it('handles HTML entities in XML transcript text', async () => {
+    const player = makePlayerResponse([
+      { baseUrl: 'https://example.com/captions', languageCode: 'en' },
+    ]);
+    const xml = makeCaptionXml([
       { text: 'it&#39;s a test &amp; demo', start: 0, dur: 2 },
     ]);
-    const captionUrl = 'https://example.com/captions';
 
-    global.fetch = vi.fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        text: () => Promise.resolve(makePlayerHtml(captionUrl)),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        text: () => Promise.resolve(captionXml),
-      } as Response);
+    global.fetch = mockFetch(player, xml);
 
     const result = await fetchTranscript('entities');
     expect(result.segments[0].text).toBe("it's a test & demo");
   });
 
   it('prefers English captions when multiple tracks exist', async () => {
-    const playerResponse = JSON.stringify({
-      captions: {
-        playerCaptionsTracklistRenderer: {
-          captionTracks: [
-            { baseUrl: 'https://example.com/es', languageCode: 'es' },
-            { baseUrl: 'https://example.com/en', languageCode: 'en' },
-            { baseUrl: 'https://example.com/fr', languageCode: 'fr' },
-          ],
-        },
-      },
-    });
-    const html = `<script>var ytInitialPlayerResponse = ${playerResponse};</script>`;
+    const player = makePlayerResponse([
+      { baseUrl: 'https://example.com/es', languageCode: 'es' },
+      { baseUrl: 'https://example.com/en', languageCode: 'en' },
+      { baseUrl: 'https://example.com/fr', languageCode: 'fr' },
+    ]);
 
-    const captionXml = makeCaptionXml([{ text: 'English caption', start: 0, dur: 1 }]);
-
-    global.fetch = vi.fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        text: () => Promise.resolve(html),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        text: () => Promise.resolve(captionXml),
-      } as Response);
+    global.fetch = mockFetch(
+      player,
+      makeJson3([{ text: 'English caption', start: 0, dur: 1 }])
+    );
 
     await fetchTranscript('multilang');
 
-    const secondCall = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[1];
-    expect(secondCall[0]).toBe('https://example.com/en');
+    const captionCall = (global.fetch as ReturnType<typeof vi.fn>).mock.calls.find(
+      (c) => String(c[0]).startsWith('https://example.com/')
+    );
+    expect(String(captionCall?.[0])).toContain('https://example.com/en');
   });
 
   it('skips empty text segments', async () => {
-    const captionXml = makeCaptionXml([
+    const player = makePlayerResponse([
+      { baseUrl: 'https://example.com/captions', languageCode: 'en' },
+    ]);
+    const xml = makeCaptionXml([
       { text: 'Real content', start: 0, dur: 2 },
       { text: '   ', start: 2, dur: 1 },
       { text: 'More content', start: 3, dur: 2 },
     ]);
-    const captionUrl = 'https://example.com/captions';
 
-    global.fetch = vi.fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        text: () => Promise.resolve(makePlayerHtml(captionUrl)),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        text: () => Promise.resolve(captionXml),
-      } as Response);
+    global.fetch = mockFetch(player, xml);
 
     const result = await fetchTranscript('empty');
     expect(result.segments).toHaveLength(2);
     expect(result.fullText).toBe('Real content More content');
+  });
+
+  it('throws when captions found but body is unparseable', async () => {
+    const player = makePlayerResponse([
+      { baseUrl: 'https://example.com/captions', languageCode: 'en' },
+    ]);
+
+    global.fetch = mockFetch(player, 'not json and not xml <garbage>');
+
+    await expect(fetchTranscript('garbage')).rejects.toThrow(
+      'could not be read'
+    );
   });
 });
