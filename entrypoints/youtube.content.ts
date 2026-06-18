@@ -1,88 +1,27 @@
 import type { VideoMetadata } from '@/lib/types';
-import { extractTranscriptFromPlayer, fetchTranscript } from '@/lib/transcript';
 
-/**
- * Asks the MAIN-world script for the live player response (always current for
- * the playing video). Resolves null if the player isn't ready in time.
- */
-function getLivePlayerResponse(): Promise<any | null> {
+function extractTranscriptViaMainWorld(
+  videoId: string
+): Promise<{ success: boolean; segments?: any[]; fullText?: string; error?: string }> {
   return new Promise((resolve) => {
     let done = false;
     const handler = (e: MessageEvent) => {
       if (e.source !== window) return;
-      if (e.data?.type !== 'REMEMBERIT_PLAYER_RESPONSE') return;
+      if (e.data?.type !== 'REMEMBERIT_RESULT') return;
       if (done) return;
       done = true;
       window.removeEventListener('message', handler);
-      try {
-        resolve(e.data.payload ? JSON.parse(e.data.payload) : null);
-      } catch {
-        resolve(null);
-      }
+      resolve(e.data);
     };
     window.addEventListener('message', handler);
-    window.postMessage({ type: 'REMEMBERIT_GET_PLAYER' }, '*');
+    window.postMessage({ type: 'REMEMBERIT_EXTRACT', videoId }, '*');
     setTimeout(() => {
       if (done) return;
       done = true;
       window.removeEventListener('message', handler);
-      resolve(null);
-    }, 2500);
+      resolve({ success: false, error: 'Main-world extraction timed out' });
+    }, 15000);
   });
-}
-
-function extractPlayerResponseFromPage(targetVideoId: string): any | null {
-  try {
-    const scripts = document.querySelectorAll('script');
-    for (const script of Array.from(scripts)) {
-      const text = script.textContent || '';
-      const marker = 'ytInitialPlayerResponse';
-      const idx = text.indexOf(marker);
-      if (idx === -1) continue;
-
-      const braceStart = text.indexOf('{', idx);
-      if (braceStart === -1) continue;
-
-      const json = extractBalancedJsonFromPage(text, braceStart);
-      if (!json) continue;
-
-      const data = JSON.parse(json);
-      const videoId = data?.videoDetails?.videoId;
-      if (videoId && videoId !== targetVideoId) continue;
-      if (data?.captions) return data;
-    }
-  } catch {
-    // extraction failed
-  }
-  return null;
-}
-
-function extractBalancedJsonFromPage(str: string, start: number): string | null {
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = start; i < str.length; i++) {
-    const char = str[i];
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (char === '\\') {
-        escaped = true;
-      } else if (char === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (char === '"') {
-      inString = true;
-    } else if (char === '{') {
-      depth++;
-    } else if (char === '}') {
-      depth--;
-      if (depth === 0) return str.slice(start, i + 1);
-    }
-  }
-  return null;
 }
 
 export default defineContentScript({
@@ -95,59 +34,7 @@ export default defineContentScript({
     browser.runtime.onMessage.addListener(
       (message: any, _sender: any, sendResponse: any) => {
         if (message.type === 'EXTRACT_TRANSCRIPT') {
-          (async () => {
-            const errors: string[] = [];
-
-            // Strategy 1: live player object (most reliable, always current).
-            try {
-              const live = await getLivePlayerResponse();
-              if (live?.captions) {
-                const result = await extractTranscriptFromPlayer(live);
-                sendResponse({
-                  success: true,
-                  segments: result.segments,
-                  fullText: result.fullText,
-                });
-                return;
-              }
-            } catch (e) {
-              errors.push(e instanceof Error ? e.message : 'live-failed');
-            }
-
-            // Strategy 2: player response embedded in the page scripts.
-            try {
-              const fromPage = extractPlayerResponseFromPage(message.videoId);
-              if (fromPage?.captions) {
-                const result = await extractTranscriptFromPlayer(fromPage);
-                sendResponse({
-                  success: true,
-                  segments: result.segments,
-                  fullText: result.fullText,
-                });
-                return;
-              }
-            } catch (e) {
-              errors.push(e instanceof Error ? e.message : 'page-failed');
-            }
-
-            // Strategy 3: InnerTube fetch from the page (same-origin, cookies).
-            try {
-              const result = await fetchTranscript(message.videoId);
-              sendResponse({
-                success: true,
-                segments: result.segments,
-                fullText: result.fullText,
-              });
-              return;
-            } catch (e) {
-              errors.push(e instanceof Error ? e.message : 'innertube-failed');
-            }
-
-            sendResponse({
-              success: false,
-              error: errors[errors.length - 1] || 'extract-failed',
-            });
-          })();
+          extractTranscriptViaMainWorld(message.videoId).then(sendResponse);
           return true;
         }
         if (message.type === 'GET_VIDEO_METADATA') {
@@ -176,7 +63,9 @@ export default defineContentScript({
 
       return {
         videoId,
-        title: titleEl?.textContent?.trim() || document.title.replace(' - YouTube', ''),
+        title:
+          titleEl?.textContent?.trim() ||
+          document.title.replace(' - YouTube', ''),
         channel: channelEl?.textContent?.trim() || 'Unknown Channel',
         thumbnailUrl: `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
       };

@@ -1,7 +1,5 @@
-// Runs in the page's MAIN world so it can access YouTube's live player object,
-// which always reflects the currently-playing video (unlike the stale
-// ytInitialPlayerResponse baked into the initial HTML after SPA navigation).
-// Bridges to the isolated content script via window.postMessage.
+import { extractTranscriptFromPlayer, fetchTranscript } from '@/lib/transcript';
+
 export default defineContentScript({
   matches: ['*://www.youtube.com/*', '*://youtube.com/*'],
   world: 'MAIN',
@@ -10,36 +8,44 @@ export default defineContentScript({
   main() {
     window.addEventListener('message', (e: MessageEvent) => {
       if (e.source !== window) return;
-      if (e.data?.type !== 'REMEMBERIT_GET_PLAYER') return;
+      if (e.data?.type !== 'REMEMBERIT_EXTRACT') return;
 
-      let pr: unknown = null;
-      try {
-        const el = document.getElementById('movie_player') as any;
-        if (el && typeof el.getPlayerResponse === 'function') {
-          pr = el.getPlayerResponse();
-        }
-      } catch {
-        // player not ready
-      }
-      if (!pr) {
+      const videoId: string = e.data.videoId;
+
+      (async () => {
         try {
-          pr = (window as any).ytInitialPlayerResponse || null;
-        } catch {
-          pr = null;
+          let playerResponse: any = null;
+          try {
+            const el = document.getElementById('movie_player') as any;
+            if (el && typeof el.getPlayerResponse === 'function') {
+              playerResponse = el.getPlayerResponse();
+            }
+          } catch {}
+          if (!playerResponse?.captions) {
+            playerResponse = (window as any).ytInitialPlayerResponse || null;
+          }
+
+          let result;
+          if (playerResponse?.captions) {
+            result = await extractTranscriptFromPlayer(playerResponse);
+          } else {
+            result = await fetchTranscript(videoId);
+          }
+
+          window.postMessage({
+            type: 'REMEMBERIT_RESULT',
+            success: true,
+            segments: result.segments,
+            fullText: result.fullText,
+          }, '*');
+        } catch (err) {
+          window.postMessage({
+            type: 'REMEMBERIT_RESULT',
+            success: false,
+            error: err instanceof Error ? err.message : 'extraction-failed',
+          }, '*');
         }
-      }
-
-      let payload: string | null = null;
-      try {
-        payload = pr ? JSON.stringify(pr) : null;
-      } catch {
-        payload = null;
-      }
-
-      window.postMessage(
-        { type: 'REMEMBERIT_PLAYER_RESPONSE', payload },
-        '*'
-      );
+      })();
     });
   },
 });
