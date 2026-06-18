@@ -38,7 +38,26 @@ async function handleMessage(
   switch (message.type) {
     case 'GET_TRANSCRIPT': {
       try {
-        const result = await fetchTranscript(message.videoId);
+        let playerResponse = null;
+        try {
+          const tabs = await browser.tabs.query({
+            active: true,
+            currentWindow: true,
+          });
+          if (tabs[0]?.id) {
+            const resp = await browser.tabs.sendMessage(tabs[0].id, {
+              type: 'EXTRACT_PLAYER_DATA',
+              videoId: message.videoId,
+            });
+            if (resp?.playerResponse?.captions) {
+              playerResponse = resp.playerResponse;
+            }
+          }
+        } catch {
+          // content script not available, fall back to InnerTube
+        }
+
+        const result = await fetchTranscript(message.videoId, playerResponse);
         return {
           success: true,
           segments: result.segments,

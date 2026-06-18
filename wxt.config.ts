@@ -13,6 +13,9 @@ export default defineConfig({
     },
     host_permissions: [
       'https://www.youtube.com/*',
+      'https://*.youtube.com/*',
+      'https://*.googlevideo.com/*',
+      'https://*.ytimg.com/*',
     ],
   },
   vite: () => ({

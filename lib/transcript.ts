@@ -1,7 +1,5 @@
 import type { TranscriptSegment } from './types';
 
-// Public InnerTube key used by the YouTube web client. Stable for years; if it
-// ever stops working we fall back to scraping the watch page.
 const INNERTUBE_API_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
 
 interface CaptionTrack {
@@ -11,9 +9,11 @@ interface CaptionTrack {
 }
 
 export async function fetchTranscript(
-  videoId: string
+  videoId: string,
+  preloadedPlayerResponse?: any
 ): Promise<{ segments: TranscriptSegment[]; fullText: string }> {
-  const playerResponse = await getPlayerResponse(videoId);
+  const playerResponse =
+    preloadedPlayerResponse || (await getPlayerResponse(videoId));
 
   const tracks: CaptionTrack[] | undefined =
     playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
@@ -38,7 +38,6 @@ export async function fetchTranscript(
 }
 
 async function getPlayerResponse(videoId: string): Promise<any | null> {
-  // Primary: InnerTube player endpoint (reliable, returns structured JSON).
   try {
     const res = await fetch(
       `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_API_KEY}&prettyPrint=false`,
@@ -48,9 +47,8 @@ async function getPlayerResponse(videoId: string): Promise<any | null> {
         body: JSON.stringify({
           context: {
             client: {
-              clientName: 'ANDROID',
-              clientVersion: '19.09.37',
-              androidSdkVersion: 30,
+              clientName: 'WEB',
+              clientVersion: '2.20240530.00.00',
               hl: 'en',
               gl: 'US',
             },
@@ -67,7 +65,6 @@ async function getPlayerResponse(videoId: string): Promise<any | null> {
     // fall through to scraping
   }
 
-  // Fallback: scrape the watch page HTML.
   return scrapeWatchPage(videoId);
 }
 
@@ -140,33 +137,37 @@ function pickTrack(tracks: CaptionTrack[]): CaptionTrack {
 async function fetchCaptionSegments(
   baseUrl: string
 ): Promise<TranscriptSegment[]> {
-  // Attempt 1: force the JSON (json3) caption format.
-  const jsonUrl = setQueryParam(baseUrl, 'fmt', 'json3');
-  const jsonBody = await fetchText(jsonUrl);
-  if (jsonBody) {
+  const formats = ['json3', 'srv1', ''];
+  for (const fmt of formats) {
+    const url = fmt ? setQueryParam(baseUrl, 'fmt', fmt) : baseUrl;
     try {
-      const data = JSON.parse(jsonBody);
-      if (data && Array.isArray(data.events)) {
-        const segments = parseJson3(data.events);
-        if (segments.length > 0) return segments;
-      }
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const text = await res.text();
+      if (!text.trim()) continue;
+      const segments = tryAllParsers(text);
+      if (segments.length > 0) return segments;
     } catch {
-      // not JSON, fall through to XML attempts
+      continue;
     }
   }
+  return [];
+}
 
-  // Attempt 2: fetch the track as-is and try the XML formats.
-  const xmlBody = await fetchText(baseUrl);
-  if (xmlBody) {
-    // srv3 / timedtext v3 uses <p t="..." d="...">...</p> (milliseconds)
-    const srv3 = parseSrv3Xml(xmlBody);
-    if (srv3.length > 0) return srv3;
-
-    // legacy format uses <text start="..." dur="...">...</text> (seconds)
-    const legacy = parseCaptionXml(xmlBody);
-    if (legacy.length > 0) return legacy;
+function tryAllParsers(text: string): TranscriptSegment[] {
+  try {
+    const data = JSON.parse(text);
+    if (data && Array.isArray(data.events)) {
+      const segments = parseJson3(data.events);
+      if (segments.length > 0) return segments;
+    }
+  } catch {
+    // not JSON
   }
-
+  const srv3 = parseSrv3Xml(text);
+  if (srv3.length > 0) return srv3;
+  const legacy = parseCaptionXml(text);
+  if (legacy.length > 0) return legacy;
   return [];
 }
 
@@ -181,16 +182,6 @@ function setQueryParam(url: string, key: string, value: string): string {
     }
     const sep = url.includes('?') ? '&' : '?';
     return `${url}${sep}${key}=${value}`;
-  }
-}
-
-async function fetchText(url: string): Promise<string> {
-  try {
-    const res = await fetch(url);
-    if (!res.ok) return '';
-    return await res.text();
-  } catch {
-    return '';
   }
 }
 

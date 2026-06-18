@@ -1,11 +1,77 @@
 import type { VideoMetadata } from '@/lib/types';
 
+function extractPlayerResponseFromPage(targetVideoId: string): any | null {
+  try {
+    const scripts = document.querySelectorAll('script');
+    for (const script of Array.from(scripts)) {
+      const text = script.textContent || '';
+      const marker = 'ytInitialPlayerResponse';
+      const idx = text.indexOf(marker);
+      if (idx === -1) continue;
+
+      const braceStart = text.indexOf('{', idx);
+      if (braceStart === -1) continue;
+
+      const json = extractBalancedJsonFromPage(text, braceStart);
+      if (!json) continue;
+
+      const data = JSON.parse(json);
+      const videoId = data?.videoDetails?.videoId;
+      if (videoId && videoId !== targetVideoId) continue;
+      if (data?.captions) return data;
+    }
+  } catch {
+    // extraction failed
+  }
+  return null;
+}
+
+function extractBalancedJsonFromPage(str: string, start: number): string | null {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < str.length; i++) {
+    const char = str[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+    } else if (char === '{') {
+      depth++;
+    } else if (char === '}') {
+      depth--;
+      if (depth === 0) return str.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
 export default defineContentScript({
   matches: ['*://www.youtube.com/*', '*://youtube.com/*'],
   runAt: 'document_idle',
 
   main() {
     let currentVideoId: string | null = null;
+
+    browser.runtime.onMessage.addListener(
+      (message: any, _sender: any, sendResponse: any) => {
+        if (message.type === 'EXTRACT_PLAYER_DATA') {
+          const playerResponse = extractPlayerResponseFromPage(
+            message.videoId
+          );
+          sendResponse({ playerResponse });
+        }
+        return true;
+      }
+    );
 
     function getVideoId(): string | null {
       const params = new URLSearchParams(window.location.search);
