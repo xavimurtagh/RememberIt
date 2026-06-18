@@ -14,7 +14,19 @@ export async function fetchTranscript(
 ): Promise<{ segments: TranscriptSegment[]; fullText: string }> {
   const playerResponse =
     preloadedPlayerResponse || (await getPlayerResponse(videoId));
+  return extractTranscriptFromPlayer(playerResponse);
+}
 
+/**
+ * Given a YouTube player response (from InnerTube or scraped from the page),
+ * downloads and parses the caption track into transcript segments. Safe to run
+ * in either the service worker or a content script — when run from a content
+ * script the caption fetch is same-origin (with cookies), which is far more
+ * reliable than a cross-origin service-worker fetch.
+ */
+export async function extractTranscriptFromPlayer(
+  playerResponse: any
+): Promise<{ segments: TranscriptSegment[]; fullText: string }> {
   const tracks: CaptionTrack[] | undefined =
     playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
 

@@ -1,4 +1,5 @@
 import type { VideoMetadata } from '@/lib/types';
+import { extractTranscriptFromPlayer } from '@/lib/transcript';
 
 function extractPlayerResponseFromPage(targetVideoId: string): any | null {
   try {
@@ -63,11 +64,30 @@ export default defineContentScript({
 
     browser.runtime.onMessage.addListener(
       (message: any, _sender: any, sendResponse: any) => {
-        if (message.type === 'EXTRACT_PLAYER_DATA') {
-          const playerResponse = extractPlayerResponseFromPage(
-            message.videoId
-          );
-          sendResponse({ playerResponse });
+        if (message.type === 'EXTRACT_TRANSCRIPT') {
+          (async () => {
+            try {
+              const playerResponse = extractPlayerResponseFromPage(
+                message.videoId
+              );
+              if (!playerResponse) {
+                sendResponse({ success: false, error: 'no-player-on-page' });
+                return;
+              }
+              const result = await extractTranscriptFromPlayer(playerResponse);
+              sendResponse({
+                success: true,
+                segments: result.segments,
+                fullText: result.fullText,
+              });
+            } catch (e) {
+              sendResponse({
+                success: false,
+                error: e instanceof Error ? e.message : 'extract-failed',
+              });
+            }
+          })();
+          return true;
         }
         return true;
       }
