@@ -1,5 +1,35 @@
 import type { VideoMetadata } from '@/lib/types';
-import { extractTranscriptFromPlayer } from '@/lib/transcript';
+import { extractTranscriptFromPlayer, fetchTranscript } from '@/lib/transcript';
+
+/**
+ * Asks the MAIN-world script for the live player response (always current for
+ * the playing video). Resolves null if the player isn't ready in time.
+ */
+function getLivePlayerResponse(): Promise<any | null> {
+  return new Promise((resolve) => {
+    let done = false;
+    const handler = (e: MessageEvent) => {
+      if (e.source !== window) return;
+      if (e.data?.type !== 'REMEMBERIT_PLAYER_RESPONSE') return;
+      if (done) return;
+      done = true;
+      window.removeEventListener('message', handler);
+      try {
+        resolve(e.data.payload ? JSON.parse(e.data.payload) : null);
+      } catch {
+        resolve(null);
+      }
+    };
+    window.addEventListener('message', handler);
+    window.postMessage({ type: 'REMEMBERIT_GET_PLAYER' }, '*');
+    setTimeout(() => {
+      if (done) return;
+      done = true;
+      window.removeEventListener('message', handler);
+      resolve(null);
+    }, 2500);
+  });
+}
 
 function extractPlayerResponseFromPage(targetVideoId: string): any | null {
   try {
@@ -66,27 +96,62 @@ export default defineContentScript({
       (message: any, _sender: any, sendResponse: any) => {
         if (message.type === 'EXTRACT_TRANSCRIPT') {
           (async () => {
+            const errors: string[] = [];
+
+            // Strategy 1: live player object (most reliable, always current).
             try {
-              const playerResponse = extractPlayerResponseFromPage(
-                message.videoId
-              );
-              if (!playerResponse) {
-                sendResponse({ success: false, error: 'no-player-on-page' });
+              const live = await getLivePlayerResponse();
+              if (live?.captions) {
+                const result = await extractTranscriptFromPlayer(live);
+                sendResponse({
+                  success: true,
+                  segments: result.segments,
+                  fullText: result.fullText,
+                });
                 return;
               }
-              const result = await extractTranscriptFromPlayer(playerResponse);
+            } catch (e) {
+              errors.push(e instanceof Error ? e.message : 'live-failed');
+            }
+
+            // Strategy 2: player response embedded in the page scripts.
+            try {
+              const fromPage = extractPlayerResponseFromPage(message.videoId);
+              if (fromPage?.captions) {
+                const result = await extractTranscriptFromPlayer(fromPage);
+                sendResponse({
+                  success: true,
+                  segments: result.segments,
+                  fullText: result.fullText,
+                });
+                return;
+              }
+            } catch (e) {
+              errors.push(e instanceof Error ? e.message : 'page-failed');
+            }
+
+            // Strategy 3: InnerTube fetch from the page (same-origin, cookies).
+            try {
+              const result = await fetchTranscript(message.videoId);
               sendResponse({
                 success: true,
                 segments: result.segments,
                 fullText: result.fullText,
               });
+              return;
             } catch (e) {
-              sendResponse({
-                success: false,
-                error: e instanceof Error ? e.message : 'extract-failed',
-              });
+              errors.push(e instanceof Error ? e.message : 'innertube-failed');
             }
+
+            sendResponse({
+              success: false,
+              error: errors[errors.length - 1] || 'extract-failed',
+            });
           })();
+          return true;
+        }
+        if (message.type === 'GET_VIDEO_METADATA') {
+          sendResponse({ metadata: getVideoMetadata() });
           return true;
         }
         return true;

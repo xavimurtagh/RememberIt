@@ -6,6 +6,7 @@ import type {
   TranscriptResponse,
   FlashcardResponse,
   DueCountResponse,
+  VideoMetadataResponse,
 } from '@/lib/messages';
 
 export default defineBackground(() => {
@@ -34,7 +35,13 @@ export default defineBackground(() => {
 
 async function handleMessage(
   message: ExtensionMessage
-): Promise<TranscriptResponse | FlashcardResponse | DueCountResponse | void> {
+): Promise<
+  | TranscriptResponse
+  | FlashcardResponse
+  | DueCountResponse
+  | VideoMetadataResponse
+  | void
+> {
   switch (message.type) {
     case 'GET_TRANSCRIPT': {
       // Primary: ask the content script to extract the transcript in the page
@@ -91,6 +98,20 @@ async function handleMessage(
         };
       }
     }
+    case 'GET_VIDEO_METADATA': {
+      try {
+        const tab = await findYouTubeTab('');
+        if (tab?.id) {
+          const resp = await browser.tabs.sendMessage(tab.id, {
+            type: 'GET_VIDEO_METADATA',
+          });
+          return { metadata: resp?.metadata || null };
+        }
+      } catch {
+        // no YouTube tab / content script
+      }
+      return { metadata: null };
+    }
     case 'GET_DUE_COUNT': {
       const count = await getDueCardCount();
       return { count };
@@ -108,9 +129,14 @@ async function handleMessage(
  * active tab in the current window; otherwise returns any YouTube watch tab for
  * the target video (the content script verifies the videoId matches the page).
  */
+interface TabLike {
+  id?: number;
+  url?: string;
+}
+
 async function findYouTubeTab(
   videoId: string
-): Promise<chrome.tabs.Tab | undefined> {
+): Promise<TabLike | undefined> {
   try {
     const [active] = await browser.tabs.query({
       active: true,

@@ -38,6 +38,16 @@ export default function App() {
       }
     };
     browser.runtime.onMessage.addListener(listener);
+
+    // Proactively pull the current tab's video when the panel opens, instead of
+    // waiting for a push that may have fired before the panel existed.
+    browser.runtime
+      .sendMessage({ type: 'GET_VIDEO_METADATA' })
+      .then((resp: { metadata?: VideoMetadata } | undefined) => {
+        if (resp?.metadata) setCurrentVideo(resp.metadata);
+      })
+      .catch(() => {});
+
     return () => browser.runtime.onMessage.removeListener(listener);
   }, []);
 
