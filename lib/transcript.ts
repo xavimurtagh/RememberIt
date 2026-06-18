@@ -140,23 +140,58 @@ function pickTrack(tracks: CaptionTrack[]): CaptionTrack {
 async function fetchCaptionSegments(
   baseUrl: string
 ): Promise<TranscriptSegment[]> {
-  // Request YouTube's JSON caption format (json3) when not already specified.
-  const url = baseUrl.includes('fmt=') ? baseUrl : `${baseUrl}&fmt=json3`;
-  const res = await fetch(url);
-  const body = await res.text();
-
-  // Try JSON (json3) format first.
-  try {
-    const data = JSON.parse(body);
-    if (data && Array.isArray(data.events)) {
-      return parseJson3(data.events);
+  // Attempt 1: force the JSON (json3) caption format.
+  const jsonUrl = setQueryParam(baseUrl, 'fmt', 'json3');
+  const jsonBody = await fetchText(jsonUrl);
+  if (jsonBody) {
+    try {
+      const data = JSON.parse(jsonBody);
+      if (data && Array.isArray(data.events)) {
+        const segments = parseJson3(data.events);
+        if (segments.length > 0) return segments;
+      }
+    } catch {
+      // not JSON, fall through to XML attempts
     }
-  } catch {
-    // not JSON, fall through to XML
   }
 
-  // Fall back to XML (timedtext) format.
-  return parseCaptionXml(body);
+  // Attempt 2: fetch the track as-is and try the XML formats.
+  const xmlBody = await fetchText(baseUrl);
+  if (xmlBody) {
+    // srv3 / timedtext v3 uses <p t="..." d="...">...</p> (milliseconds)
+    const srv3 = parseSrv3Xml(xmlBody);
+    if (srv3.length > 0) return srv3;
+
+    // legacy format uses <text start="..." dur="...">...</text> (seconds)
+    const legacy = parseCaptionXml(xmlBody);
+    if (legacy.length > 0) return legacy;
+  }
+
+  return [];
+}
+
+function setQueryParam(url: string, key: string, value: string): string {
+  try {
+    const u = new URL(url);
+    u.searchParams.set(key, value);
+    return u.toString();
+  } catch {
+    if (new RegExp(`[?&]${key}=`).test(url)) {
+      return url.replace(new RegExp(`([?&]${key}=)[^&]*`), `$1${value}`);
+    }
+    const sep = url.includes('?') ? '&' : '?';
+    return `${url}${sep}${key}=${value}`;
+  }
+}
+
+async function fetchText(url: string): Promise<string> {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return '';
+    return await res.text();
+  } catch {
+    return '';
+  }
 }
 
 interface Json3Event {
@@ -181,6 +216,37 @@ function parseJson3(events: Json3Event[]): TranscriptSegment[] {
         start: (event.tStartMs || 0) / 1000,
         duration: (event.dDurationMs || 0) / 1000,
       });
+    }
+  }
+
+  return segments;
+}
+
+/**
+ * Parses the srv3 / timedtext v3 format:
+ *   <p t="0" d="5000">Hello</p>
+ *   <p t="5000" d="3000"><s>multi</s><s> segment</s></p>
+ * Timing attributes are in milliseconds.
+ */
+function parseSrv3Xml(xml: string): TranscriptSegment[] {
+  const segments: TranscriptSegment[] = [];
+  const regex = /<p\s+([^>]*?)>([\s\S]*?)<\/p>/g;
+
+  let match;
+  while ((match = regex.exec(xml)) !== null) {
+    const attrs = match[1];
+    const tMatch = attrs.match(/\bt="(\d+)"/);
+    const dMatch = attrs.match(/\bd="(\d+)"/);
+
+    const start = tMatch ? parseInt(tMatch[1], 10) / 1000 : 0;
+    const duration = dMatch ? parseInt(dMatch[1], 10) / 1000 : 0;
+
+    // strip inner <s> segment tags and any other markup, keep the text
+    const inner = match[2].replace(/<[^>]+>/g, '');
+    const text = decodeHtmlEntities(inner).replace(/\s+/g, ' ').trim();
+
+    if (text) {
+      segments.push({ text, start, duration });
     }
   }
 

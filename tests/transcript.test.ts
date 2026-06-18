@@ -114,6 +114,27 @@ describe('Transcript Extraction', () => {
     expect(result.fullText).toBe('First line Second line');
   });
 
+  it('extracts transcript using srv3 caption format', async () => {
+    const player = makePlayerResponse([
+      { baseUrl: 'https://example.com/captions', languageCode: 'en' },
+    ]);
+    const srv3 = `<?xml version="1.0" encoding="utf-8"?><timedtext format="3"><body>` +
+      `<p t="0" d="2000">Hello there</p>` +
+      `<p t="2000" d="3000"><s>multi</s><s> segment</s> line</p>` +
+      `</body></timedtext>`;
+
+    // json3 attempt returns the srv3 XML (JSON.parse fails) → falls back to srv3 parse
+    global.fetch = mockFetch(player, srv3);
+
+    const result = await fetchTranscript('srv3vid');
+    expect(result.segments).toHaveLength(2);
+    expect(result.segments[0].text).toBe('Hello there');
+    expect(result.segments[0].start).toBe(0);
+    expect(result.segments[0].duration).toBe(2);
+    expect(result.segments[1].text).toBe('multi segment line');
+    expect(result.segments[1].start).toBe(2);
+  });
+
   it('throws error when no captions are available', async () => {
     const player = makePlayerResponse([]);
     global.fetch = mockFetch(player, '');
