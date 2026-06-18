@@ -300,3 +300,45 @@ function decodeHtmlEntities(text: string): string {
   decoded = decoded.replace(/\n/g, ' ');
   return decoded;
 }
+
+// ── DOM-scrape fallback helpers ─────────────────────────────────────
+// These convert rows scraped from YouTube's rendered "Show transcript"
+// panel into TranscriptSegment[]. Scraping the panel sidesteps the caption
+// URL's Proof-of-Origin-Token (POT) requirement entirely, because the player
+// has already fetched and rendered the captions. The DOM walking itself lives
+// in the content script; these helpers are pure so they can be unit-tested.
+
+/**
+ * Parses a YouTube timestamp label into seconds. Accepts "M:SS", "MM:SS" and
+ * "H:MM:SS" forms. Returns 0 for empty or unrecognised input.
+ */
+export function parseTimestampLabel(label: string): number {
+  const trimmed = label.trim();
+  if (!trimmed) return 0;
+  const parts = trimmed.split(':').map((p) => parseInt(p, 10));
+  if (parts.length === 0 || parts.some((n) => Number.isNaN(n))) return 0;
+  return parts.reduce((acc, n) => acc * 60 + n, 0);
+}
+
+/**
+ * Converts raw transcript rows scraped from the panel into TranscriptSegment[].
+ * Each row carries a timestamp label and the spoken text. Panel rows have no
+ * duration, so each segment's duration is derived from the gap to the next
+ * row's start time (the final row gets 0).
+ */
+export function buildSegmentsFromScrapedRows(
+  rows: { timestamp: string; text: string }[]
+): TranscriptSegment[] {
+  const cleaned = rows
+    .map((r) => ({
+      start: parseTimestampLabel(r.timestamp),
+      text: decodeHtmlEntities(r.text).replace(/\s+/g, ' ').trim(),
+    }))
+    .filter((r) => r.text.length > 0);
+
+  return cleaned.map((r, i) => {
+    const next = cleaned[i + 1];
+    const duration = next ? Math.max(0, next.start - r.start) : 0;
+    return { text: r.text, start: r.start, duration };
+  });
+}

@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { fetchTranscript } from '@/lib/transcript';
+import {
+  fetchTranscript,
+  parseTimestampLabel,
+  buildSegmentsFromScrapedRows,
+} from '@/lib/transcript';
 
 describe('Transcript Extraction', () => {
   beforeEach(() => {
@@ -221,5 +225,75 @@ describe('Transcript Extraction', () => {
     await expect(fetchTranscript('garbage')).rejects.toThrow(
       'could not be read'
     );
+  });
+});
+
+describe('DOM-scraped transcript helpers', () => {
+  describe('parseTimestampLabel', () => {
+    it('parses M:SS', () => {
+      expect(parseTimestampLabel('0:05')).toBe(5);
+      expect(parseTimestampLabel('1:23')).toBe(83);
+    });
+
+    it('parses MM:SS and H:MM:SS', () => {
+      expect(parseTimestampLabel('12:34')).toBe(754);
+      expect(parseTimestampLabel('1:02:03')).toBe(3723);
+    });
+
+    it('tolerates surrounding whitespace', () => {
+      expect(parseTimestampLabel('  2:00  ')).toBe(120);
+    });
+
+    it('returns 0 for empty or unrecognised input', () => {
+      expect(parseTimestampLabel('')).toBe(0);
+      expect(parseTimestampLabel('abc')).toBe(0);
+    });
+  });
+
+  describe('buildSegmentsFromScrapedRows', () => {
+    it('derives durations from the gap to the next row', () => {
+      const segments = buildSegmentsFromScrapedRows([
+        { timestamp: '0:00', text: 'Hello world' },
+        { timestamp: '0:03', text: 'This is a test' },
+        { timestamp: '0:08', text: 'Goodbye' },
+      ]);
+
+      expect(segments).toHaveLength(3);
+      expect(segments[0]).toEqual({ text: 'Hello world', start: 0, duration: 3 });
+      expect(segments[1]).toEqual({
+        text: 'This is a test',
+        start: 3,
+        duration: 5,
+      });
+      // Final row has no following row, so duration is 0.
+      expect(segments[2]).toEqual({ text: 'Goodbye', start: 8, duration: 0 });
+    });
+
+    it('skips empty rows and collapses whitespace', () => {
+      const segments = buildSegmentsFromScrapedRows([
+        { timestamp: '0:00', text: '  Real   content ' },
+        { timestamp: '0:02', text: '   ' },
+        { timestamp: '0:04', text: 'More content' },
+      ]);
+
+      expect(segments).toHaveLength(2);
+      expect(segments[0].text).toBe('Real content');
+      expect(segments[1].text).toBe('More content');
+    });
+
+    it('decodes HTML entities in scraped text', () => {
+      const segments = buildSegmentsFromScrapedRows([
+        { timestamp: '0:00', text: 'it&#39;s a test &amp; demo' },
+      ]);
+      expect(segments[0].text).toBe("it's a test & demo");
+    });
+
+    it('produces text joinable into a full transcript', () => {
+      const segments = buildSegmentsFromScrapedRows([
+        { timestamp: '0:00', text: 'one' },
+        { timestamp: '0:01', text: 'two' },
+      ]);
+      expect(segments.map((s) => s.text).join(' ')).toBe('one two');
+    });
   });
 });

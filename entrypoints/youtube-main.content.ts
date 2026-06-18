@@ -104,17 +104,24 @@ function extractTranscriptParamsFromPage(videoId: string): string | null {
   return null;
 }
 
-function buildTranscriptParams(videoId: string, lang = 'en'): string {
+function buildTranscriptParams(
+  videoId: string,
+  lang = 'en',
+  kind: 'asr' | '' = 'asr'
+): string {
   const enc = new TextEncoder();
   const vidBytes = enc.encode(videoId);
   const langBytes = enc.encode(lang);
-  const asrBytes = enc.encode('asr');
 
-  const langMsg = new Uint8Array([
-    0x0a, asrBytes.length, ...asrBytes,
-    0x12, langBytes.length, ...langBytes,
-    0x1a, 0x00,
-  ]);
+  // Inner message: optional caption "kind" (asr = auto-generated), language,
+  // and an empty trailing field. Manual captions omit the kind field.
+  const langMsg: number[] = [];
+  if (kind) {
+    const kindBytes = enc.encode(kind);
+    langMsg.push(0x0a, kindBytes.length, ...kindBytes);
+  }
+  langMsg.push(0x12, langBytes.length, ...langBytes);
+  langMsg.push(0x1a, 0x00);
 
   const outer = new Uint8Array([
     0x0a, vidBytes.length, ...vidBytes,
@@ -127,32 +134,44 @@ function buildTranscriptParams(videoId: string, lang = 'en'): string {
 async function fetchViaGetTranscript(
   videoId: string
 ): Promise<TranscriptSegment[]> {
-  const params =
-    extractTranscriptParamsFromPage(videoId) ||
-    buildTranscriptParams(videoId);
+  // Prefer the exact params token YouTube put on the page; otherwise try both
+  // auto-generated (asr) and manual caption variants for English.
+  const candidates = [
+    extractTranscriptParamsFromPage(videoId),
+    buildTranscriptParams(videoId, 'en', 'asr'),
+    buildTranscriptParams(videoId, 'en', ''),
+  ].filter((p): p is string => !!p);
 
-  const res = await fetch(
-    'https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false',
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        context: {
-          client: {
-            clientName: 'WEB',
-            clientVersion: '2.20240530.00.00',
-            hl: 'en',
-            gl: 'US',
-          },
-        },
-        params,
-      }),
+  for (const params of candidates) {
+    try {
+      const res = await fetch(
+        'https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            context: {
+              client: {
+                clientName: 'WEB',
+                clientVersion: '2.20240530.00.00',
+                hl: 'en',
+                gl: 'US',
+              },
+            },
+            params,
+          }),
+        }
+      );
+      if (!res.ok) continue;
+      const data = await res.json();
+      const segments = parseTranscriptResponse(data);
+      if (segments.length > 0) return segments;
+    } catch {
+      // try the next candidate
     }
-  );
+  }
 
-  if (!res.ok) return [];
-  const data = await res.json();
-  return parseTranscriptResponse(data);
+  return [];
 }
 
 function parseTranscriptResponse(data: any): TranscriptSegment[] {

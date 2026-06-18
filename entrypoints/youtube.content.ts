@@ -1,8 +1,14 @@
-import type { VideoMetadata } from '@/lib/types';
+import type { TranscriptSegment, VideoMetadata } from '@/lib/types';
+import { buildSegmentsFromScrapedRows } from '@/lib/transcript';
 
-function extractTranscriptViaMainWorld(
-  videoId: string
-): Promise<{ success: boolean; segments?: any[]; fullText?: string; error?: string }> {
+interface ExtractResult {
+  success: boolean;
+  segments?: TranscriptSegment[];
+  fullText?: string;
+  error?: string;
+}
+
+function extractTranscriptViaMainWorld(videoId: string): Promise<ExtractResult> {
   return new Promise((resolve) => {
     let done = false;
     const handler = (e: MessageEvent) => {
@@ -24,6 +30,117 @@ function extractTranscriptViaMainWorld(
   });
 }
 
+/**
+ * Orchestrates transcript extraction with a POT-proof fallback:
+ *   1. InnerTube strategies in the page's MAIN world (get_transcript + caption
+ *      URL). These are fast and clean when they work.
+ *   2. Scrape YouTube's rendered "Show transcript" panel. The player has
+ *      already loaded the captions, so this works even when the caption URL is
+ *      gated behind a Proof-of-Origin Token.
+ */
+async function handleExtractTranscript(videoId: string): Promise<ExtractResult> {
+  const viaMain = await extractTranscriptViaMainWorld(videoId);
+  if (viaMain.success && viaMain.segments?.length) return viaMain;
+
+  try {
+    const segments = await scrapeTranscriptFromDom(videoId);
+    if (segments.length > 0) {
+      return {
+        success: true,
+        segments,
+        fullText: segments.map((s) => s.text).join(' '),
+      };
+    }
+  } catch {
+    // fall through to the main-world error below
+  }
+
+  return viaMain.error
+    ? viaMain
+    : { success: false, error: 'Could not read the transcript for this video.' };
+}
+
+const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function getCurrentVideoId(): string | null {
+  return new URLSearchParams(window.location.search).get('v');
+}
+
+function readTranscriptRows(): { timestamp: string; text: string }[] {
+  const rows: { timestamp: string; text: string }[] = [];
+  document
+    .querySelectorAll('ytd-transcript-segment-renderer')
+    .forEach((seg) => {
+      const timestamp =
+        seg.querySelector('.segment-timestamp')?.textContent?.trim() || '';
+      const text =
+        seg.querySelector('.segment-text')?.textContent?.trim() || '';
+      if (text) rows.push({ timestamp, text });
+    });
+  return rows;
+}
+
+function findShowTranscriptButton(): HTMLElement | null {
+  const aria = document.querySelector(
+    'button[aria-label*="transcript" i]'
+  ) as HTMLElement | null;
+  if (aria) return aria;
+
+  const buttons = document.querySelectorAll(
+    'ytd-button-renderer button, yt-button-shape button, button'
+  );
+  for (const b of Array.from(buttons)) {
+    if ((b.textContent || '').toLowerCase().includes('transcript')) {
+      return b as HTMLElement;
+    }
+  }
+  return null;
+}
+
+async function openTranscriptPanel(): Promise<void> {
+  // Force the searchable-transcript engagement panel open (locale-independent).
+  const panel = document.querySelector(
+    'ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"]'
+  );
+  if (panel) {
+    panel.setAttribute(
+      'visibility',
+      'ENGAGEMENT_PANEL_VISIBILITY_EXPANDED'
+    );
+  }
+
+  // Some layouts only render the button after the description is expanded.
+  const expand = document.querySelector(
+    '#description-inline-expander #expand, tp-yt-paper-button#expand'
+  ) as HTMLElement | null;
+  if (expand) {
+    expand.click();
+    await delay(250);
+  }
+
+  const btn = findShowTranscriptButton();
+  if (btn) btn.click();
+}
+
+async function scrapeTranscriptFromDom(
+  videoId: string
+): Promise<TranscriptSegment[]> {
+  // Only scrape when the page actually shows the requested video.
+  if (getCurrentVideoId() !== videoId) return [];
+
+  let rows = readTranscriptRows();
+  if (rows.length === 0) {
+    await openTranscriptPanel();
+    const deadline = Date.now() + 5000;
+    while (rows.length === 0 && Date.now() < deadline) {
+      await delay(200);
+      rows = readTranscriptRows();
+    }
+  }
+
+  return buildSegmentsFromScrapedRows(rows);
+}
+
 export default defineContentScript({
   matches: ['*://www.youtube.com/*', '*://youtube.com/*'],
   runAt: 'document_idle',
@@ -34,7 +151,7 @@ export default defineContentScript({
     browser.runtime.onMessage.addListener(
       (message: any, _sender: any, sendResponse: any) => {
         if (message.type === 'EXTRACT_TRANSCRIPT') {
-          extractTranscriptViaMainWorld(message.videoId).then(sendResponse);
+          handleExtractTranscript(message.videoId).then(sendResponse);
           return true;
         }
         if (message.type === 'GET_VIDEO_METADATA') {
