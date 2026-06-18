@@ -50,6 +50,7 @@ async function generateWithChromeAI(
   const trimmed = transcript.slice(0, MAX_TRANSCRIPT_LENGTH);
 
   const session = await LanguageModel.create({
+    expectedOutputLanguages: ['en'],
     initialPrompts: [
       {
         role: 'system',
