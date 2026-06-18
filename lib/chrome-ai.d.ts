@@ -14,6 +14,8 @@ interface LanguageModelCreateOptions {
   }>;
   temperature?: number;
   topK?: number;
+  expectedInputLanguages?: string[];
+  expectedOutputLanguages?: string[];
   monitor?: (monitor: EventTarget) => void;
 }
 
