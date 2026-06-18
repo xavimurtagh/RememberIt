@@ -42,8 +42,10 @@ async function handleExtractTranscript(videoId: string): Promise<ExtractResult> 
   const viaMain = await extractTranscriptViaMainWorld(videoId);
   if (viaMain.success && viaMain.segments?.length) return viaMain;
 
+  let domDiag = 'not attempted';
   try {
-    const segments = await scrapeTranscriptFromDom(videoId);
+    const { segments, diag } = await scrapeTranscriptFromDom(videoId);
+    domDiag = diag;
     if (segments.length > 0) {
       return {
         success: true,
@@ -51,13 +53,18 @@ async function handleExtractTranscript(videoId: string): Promise<ExtractResult> 
         fullText: segments.map((s) => s.text).join(' '),
       };
     }
-  } catch {
-    // fall through to the main-world error below
+  } catch (err) {
+    domDiag = err instanceof Error ? err.message : 'scrape failed';
   }
 
-  return viaMain.error
-    ? viaMain
-    : { success: false, error: 'Could not read the transcript for this video.' };
+  // Surface what each strategy did so failures are diagnosable from the panel.
+  const parts: string[] = [];
+  if (viaMain.error) parts.push(viaMain.error);
+  parts.push(`panel: ${domDiag}`);
+  return {
+    success: false,
+    error: `Could not read the transcript. (${parts.join(' | ')})`,
+  };
 }
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -73,72 +80,99 @@ function readTranscriptRows(): { timestamp: string; text: string }[] {
     .forEach((seg) => {
       const timestamp =
         seg.querySelector('.segment-timestamp')?.textContent?.trim() || '';
-      const text =
-        seg.querySelector('.segment-text')?.textContent?.trim() || '';
+      const textEl =
+        seg.querySelector('.segment-text') ||
+        seg.querySelector('yt-formatted-string');
+      const text = textEl?.textContent?.trim() || '';
       if (text) rows.push({ timestamp, text });
     });
   return rows;
 }
 
 function findShowTranscriptButton(): HTMLElement | null {
-  const aria = document.querySelector(
-    'button[aria-label*="transcript" i]'
-  ) as HTMLElement | null;
-  if (aria) return aria;
+  const selectors = [
+    'ytd-video-description-transcript-section-renderer button',
+    'button[aria-label*="transcript" i]',
+    'a[aria-label*="transcript" i]',
+    'yt-button-shape button[aria-label*="transcript" i]',
+  ];
+  for (const sel of selectors) {
+    const el = document.querySelector(sel) as HTMLElement | null;
+    if (el) return el;
+  }
 
-  const buttons = document.querySelectorAll(
-    'ytd-button-renderer button, yt-button-shape button, button'
+  const clickables = document.querySelectorAll(
+    'ytd-button-renderer button, yt-button-shape button, button, a'
   );
-  for (const b of Array.from(buttons)) {
-    if ((b.textContent || '').toLowerCase().includes('transcript')) {
-      return b as HTMLElement;
+  for (const el of Array.from(clickables)) {
+    if ((el.textContent || '').toLowerCase().includes('transcript')) {
+      return el as HTMLElement;
     }
   }
   return null;
 }
 
-async function openTranscriptPanel(): Promise<void> {
+/** Attempts to open the transcript panel. Returns true if anything was clicked. */
+async function openTranscriptPanel(): Promise<boolean> {
+  let acted = false;
+
+  // Some layouts only render the "Show transcript" control after the
+  // description's "...more" expander is opened.
+  const expand = document.querySelector(
+    '#description-inline-expander #expand, tp-yt-paper-button#expand, #expand'
+  ) as HTMLElement | null;
+  if (expand) {
+    expand.click();
+    acted = true;
+    await delay(400);
+  }
+
   // Force the searchable-transcript engagement panel open (locale-independent).
   const panel = document.querySelector(
     'ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"]'
   );
   if (panel) {
-    panel.setAttribute(
-      'visibility',
-      'ENGAGEMENT_PANEL_VISIBILITY_EXPANDED'
-    );
-  }
-
-  // Some layouts only render the button after the description is expanded.
-  const expand = document.querySelector(
-    '#description-inline-expander #expand, tp-yt-paper-button#expand'
-  ) as HTMLElement | null;
-  if (expand) {
-    expand.click();
-    await delay(250);
+    panel.setAttribute('visibility', 'ENGAGEMENT_PANEL_VISIBILITY_EXPANDED');
+    acted = true;
   }
 
   const btn = findShowTranscriptButton();
-  if (btn) btn.click();
+  if (btn) {
+    btn.click();
+    acted = true;
+  }
+
+  return acted;
 }
 
 async function scrapeTranscriptFromDom(
   videoId: string
-): Promise<TranscriptSegment[]> {
+): Promise<{ segments: TranscriptSegment[]; diag: string }> {
   // Only scrape when the page actually shows the requested video.
-  if (getCurrentVideoId() !== videoId) return [];
+  if (getCurrentVideoId() !== videoId) {
+    return { segments: [], diag: 'not on the video page' };
+  }
 
   let rows = readTranscriptRows();
   if (rows.length === 0) {
-    await openTranscriptPanel();
-    const deadline = Date.now() + 5000;
+    const opened = await openTranscriptPanel();
+    const deadline = Date.now() + 6000;
     while (rows.length === 0 && Date.now() < deadline) {
-      await delay(200);
+      await delay(250);
       rows = readTranscriptRows();
+    }
+    if (rows.length === 0) {
+      return {
+        segments: [],
+        diag: opened
+          ? 'opened panel but no segments rendered'
+          : 'no transcript control found',
+      };
     }
   }
 
-  return buildSegmentsFromScrapedRows(rows);
+  const segments = buildSegmentsFromScrapedRows(rows);
+  return { segments, diag: `scraped ${segments.length} segments` };
 }
 
 export default defineContentScript({

@@ -301,6 +301,38 @@ function decodeHtmlEntities(text: string): string {
   return decoded;
 }
 
+/**
+ * Recursively searches a YouTube data object (ytInitialData / player response)
+ * for a `getTranscriptEndpoint.params` token. YouTube generates this token
+ * itself, so using it avoids the 400 Bad Request that hand-built protobuf
+ * params produce. Returns null if the page hasn't embedded a transcript token.
+ */
+export function findTranscriptEndpointParams(root: unknown): string | null {
+  const seen = new Set<unknown>();
+  const stack: unknown[] = [root];
+
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node || typeof node !== 'object' || seen.has(node)) continue;
+    seen.add(node);
+
+    const obj = node as Record<string, unknown>;
+    const endpoint = obj.getTranscriptEndpoint as
+      | { params?: unknown }
+      | undefined;
+    if (endpoint && typeof endpoint.params === 'string') {
+      return endpoint.params;
+    }
+
+    for (const key in obj) {
+      const value = obj[key];
+      if (value && typeof value === 'object') stack.push(value);
+    }
+  }
+
+  return null;
+}
+
 // ── DOM-scrape fallback helpers ─────────────────────────────────────
 // These convert rows scraped from YouTube's rendered "Show transcript"
 // panel into TranscriptSegment[]. Scraping the panel sidesteps the caption

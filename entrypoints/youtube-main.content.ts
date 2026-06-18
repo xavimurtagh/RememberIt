@@ -1,4 +1,8 @@
-import { extractTranscriptFromPlayer, fetchTranscript } from '@/lib/transcript';
+import {
+  extractTranscriptFromPlayer,
+  fetchTranscript,
+  findTranscriptEndpointParams,
+} from '@/lib/transcript';
 import type { TranscriptSegment } from '@/lib/types';
 
 export default defineContentScript({
@@ -20,7 +24,7 @@ export default defineContentScript({
         // Returns transcript text directly — bypasses the timedtext caption URL
         // and its Proof-of-Origin Token (POT) requirement entirely.
         try {
-          const segments = await fetchViaGetTranscript(videoId);
+          const { segments, diag } = await fetchViaGetTranscript(videoId);
           if (segments.length > 0) {
             window.postMessage({
               type: 'REMEMBERIT_RESULT',
@@ -30,8 +34,11 @@ export default defineContentScript({
             }, '*');
             return;
           }
+          errors.push(`get_transcript: ${diag}`);
         } catch (err) {
-          errors.push(err instanceof Error ? err.message : 'get_transcript failed');
+          errors.push(
+            `get_transcript: ${err instanceof Error ? err.message : 'failed'}`
+          );
         }
 
         // Strategy 2: live player response + caption URL fetch (same-origin).
@@ -60,7 +67,9 @@ export default defineContentScript({
           }, '*');
           return;
         } catch (err) {
-          errors.push(err instanceof Error ? err.message : 'caption-url failed');
+          errors.push(
+            `caption-url: ${err instanceof Error ? err.message : 'failed'}`
+          );
         }
 
         window.postMessage({
@@ -73,105 +82,84 @@ export default defineContentScript({
   },
 });
 
-function extractTranscriptParamsFromPage(videoId: string): string | null {
-  try {
-    const ytData = (window as any).ytInitialData;
-    if (!ytData?.engagementPanels) return null;
-
-    for (const panel of ytData.engagementPanels) {
-      const renderer = panel?.engagementPanelSectionListRenderer;
-      if (!renderer) continue;
-      const panelId = renderer.panelIdentifier || '';
-      if (panelId && !panelId.includes('transcript')) continue;
-
-      const contents = renderer.content?.sectionListRenderer?.contents;
-      if (!Array.isArray(contents)) continue;
-
-      for (const item of contents) {
-        const endpoint =
-          item?.continuationItemRenderer?.continuationEndpoint
-            ?.getTranscriptEndpoint;
-        if (endpoint?.params) {
-          try {
-            const decoded = atob(endpoint.params);
-            if (decoded.includes(videoId)) return endpoint.params;
-          } catch {}
-          return endpoint.params;
-        }
-      }
+/**
+ * Reads the page's InnerTube configuration so our request matches the one the
+ * YouTube page itself makes (client version, API key, visitor id). Using stale
+ * or mismatched values is a common cause of 400 / empty responses.
+ */
+function getInnertubeConfig(): {
+  clientVersion: string;
+  apiKey: string;
+  visitorData: string;
+} {
+  const cfg = (window as any).ytcfg;
+  const get = (name: string): string => {
+    try {
+      if (cfg?.get) return cfg.get(name) || '';
+      return cfg?.data_?.[name] || '';
+    } catch {
+      return '';
     }
-  } catch {}
-  return null;
-}
-
-function buildTranscriptParams(
-  videoId: string,
-  lang = 'en',
-  kind: 'asr' | '' = 'asr'
-): string {
-  const enc = new TextEncoder();
-  const vidBytes = enc.encode(videoId);
-  const langBytes = enc.encode(lang);
-
-  // Inner message: optional caption "kind" (asr = auto-generated), language,
-  // and an empty trailing field. Manual captions omit the kind field.
-  const langMsg: number[] = [];
-  if (kind) {
-    const kindBytes = enc.encode(kind);
-    langMsg.push(0x0a, kindBytes.length, ...kindBytes);
-  }
-  langMsg.push(0x12, langBytes.length, ...langBytes);
-  langMsg.push(0x1a, 0x00);
-
-  const outer = new Uint8Array([
-    0x0a, vidBytes.length, ...vidBytes,
-    0x12, langMsg.length, ...langMsg,
-  ]);
-
-  return btoa(String.fromCharCode(...outer));
+  };
+  return {
+    clientVersion: get('INNERTUBE_CLIENT_VERSION') || '2.20240530.00.00',
+    apiKey: get('INNERTUBE_API_KEY'),
+    visitorData: get('VISITOR_DATA'),
+  };
 }
 
 async function fetchViaGetTranscript(
   videoId: string
-): Promise<TranscriptSegment[]> {
-  // Prefer the exact params token YouTube put on the page; otherwise try both
-  // auto-generated (asr) and manual caption variants for English.
-  const candidates = [
-    extractTranscriptParamsFromPage(videoId),
-    buildTranscriptParams(videoId, 'en', 'asr'),
-    buildTranscriptParams(videoId, 'en', ''),
-  ].filter((p): p is string => !!p);
+): Promise<{ segments: TranscriptSegment[]; diag: string }> {
+  // Use the transcript token YouTube embedded in the page. It is the only
+  // reliably-valid params value — hand-built protobuf tokens are rejected with
+  // a 400. The token usually appears once the page (or its transcript panel)
+  // has loaded.
+  const params =
+    findTranscriptEndpointParams((window as any).ytInitialData) ||
+    findTranscriptEndpointParams((window as any).ytInitialPlayerResponse);
 
-  for (const params of candidates) {
-    try {
-      const res = await fetch(
-        'https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false',
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            context: {
-              client: {
-                clientName: 'WEB',
-                clientVersion: '2.20240530.00.00',
-                hl: 'en',
-                gl: 'US',
-              },
-            },
-            params,
-          }),
-        }
-      );
-      if (!res.ok) continue;
-      const data = await res.json();
-      const segments = parseTranscriptResponse(data);
-      if (segments.length > 0) return segments;
-    } catch {
-      // try the next candidate
-    }
+  if (!params) {
+    return { segments: [], diag: 'no transcript token on page' };
   }
 
-  return [];
+  const { clientVersion, apiKey, visitorData } = getInnertubeConfig();
+  const url =
+    'https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false' +
+    (apiKey ? `&key=${apiKey}` : '');
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: 'WEB',
+            clientVersion,
+            hl: 'en',
+            gl: 'US',
+            ...(visitorData ? { visitorData } : {}),
+          },
+        },
+        params,
+      }),
+    });
+
+    if (!res.ok) return { segments: [], diag: `HTTP ${res.status}` };
+
+    const data = await res.json();
+    const segments = parseTranscriptResponse(data);
+    return {
+      segments,
+      diag: segments.length > 0 ? 'ok' : 'empty response',
+    };
+  } catch (err) {
+    return {
+      segments: [],
+      diag: err instanceof Error ? err.message : 'request failed',
+    };
+  }
 }
 
 function parseTranscriptResponse(data: any): TranscriptSegment[] {

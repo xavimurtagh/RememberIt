@@ -3,6 +3,7 @@ import {
   fetchTranscript,
   parseTimestampLabel,
   buildSegmentsFromScrapedRows,
+  findTranscriptEndpointParams,
 } from '@/lib/transcript';
 
 describe('Transcript Extraction', () => {
@@ -294,6 +295,46 @@ describe('DOM-scraped transcript helpers', () => {
         { timestamp: '0:01', text: 'two' },
       ]);
       expect(segments.map((s) => s.text).join(' ')).toBe('one two');
+    });
+  });
+
+  describe('findTranscriptEndpointParams', () => {
+    it('finds a deeply nested getTranscriptEndpoint.params token', () => {
+      const ytInitialData = {
+        engagementPanels: [
+          {
+            engagementPanelSectionListRenderer: {
+              content: {
+                sectionListRenderer: {
+                  contents: [
+                    {
+                      continuationItemRenderer: {
+                        continuationEndpoint: {
+                          getTranscriptEndpoint: { params: 'TOKEN_ABC123' },
+                        },
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        ],
+      };
+      expect(findTranscriptEndpointParams(ytInitialData)).toBe('TOKEN_ABC123');
+    });
+
+    it('returns null when no token is present', () => {
+      expect(findTranscriptEndpointParams({ a: { b: [1, 2, 3] } })).toBeNull();
+      expect(findTranscriptEndpointParams(null)).toBeNull();
+      expect(findTranscriptEndpointParams(undefined)).toBeNull();
+    });
+
+    it('does not loop forever on circular references', () => {
+      const a: Record<string, unknown> = {};
+      a.self = a;
+      a.child = { getTranscriptEndpoint: { params: 'CYCLE_OK' } };
+      expect(findTranscriptEndpointParams(a)).toBe('CYCLE_OK');
     });
   });
 });
