@@ -47,24 +47,44 @@ function extractCaptionUrl(html: string): string | null {
 
 function parseCaptionXml(xml: string): TranscriptSegment[] {
   const segments: TranscriptSegment[] = [];
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(xml, 'text/xml');
-  const texts = doc.querySelectorAll('text');
+  const regex = /<text\s+start="([^"]*)"(?:\s+dur="([^"]*)")?[^>]*>([\s\S]*?)<\/text>/g;
 
-  texts.forEach((node) => {
-    const start = parseFloat(node.getAttribute('start') || '0');
-    const duration = parseFloat(node.getAttribute('dur') || '0');
-    const text = decodeHtmlEntities(node.textContent || '');
+  let match;
+  while ((match = regex.exec(xml)) !== null) {
+    const start = parseFloat(match[1] || '0');
+    const duration = parseFloat(match[2] || '0');
+    const rawText = match[3] || '';
+    const text = decodeHtmlEntities(rawText);
     if (text.trim()) {
       segments.push({ text: text.trim(), start, duration });
     }
-  });
+  }
 
   return segments;
 }
 
+const HTML_ENTITY_MAP: Record<string, string> = {
+  '&amp;': '&',
+  '&lt;': '<',
+  '&gt;': '>',
+  '&quot;': '"',
+  '&#39;': "'",
+  '&apos;': "'",
+  '&#x27;': "'",
+  '&#x2F;': '/',
+  '&nbsp;': ' ',
+};
+
 function decodeHtmlEntities(text: string): string {
-  const textarea = document.createElement('textarea');
-  textarea.innerHTML = text;
-  return textarea.value;
+  let decoded = text.replace(
+    /&(?:#(\d+)|#x([0-9a-fA-F]+)|[a-zA-Z]+);/g,
+    (entity, decimal, hex) => {
+      if (HTML_ENTITY_MAP[entity]) return HTML_ENTITY_MAP[entity];
+      if (decimal) return String.fromCharCode(parseInt(decimal, 10));
+      if (hex) return String.fromCharCode(parseInt(hex, 16));
+      return entity;
+    }
+  );
+  decoded = decoded.replace(/\n/g, ' ');
+  return decoded;
 }
