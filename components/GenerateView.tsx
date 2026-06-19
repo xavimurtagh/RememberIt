@@ -19,6 +19,7 @@ export default function GenerateView({ currentVideo, onSaved }: Props) {
   const [videoId, setVideoId] = useState('');
   const [metadata, setMetadata] = useState<VideoMetadata | null>(currentVideo);
   const [cardCount, setCardCount] = useState(10);
+  const [isCustomCount, setIsCustomCount] = useState(false);
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
@@ -84,13 +85,14 @@ export default function GenerateView({ currentVideo, onSaved }: Props) {
       setMetadata(meta);
 
       setStatus('Generating flashcards...');
+      const count = Math.max(1, Math.min(50, Math.round(cardCount) || 10));
       const flashcardRes: FlashcardResponse = await browser.runtime.sendMessage({
         type: 'GENERATE_FLASHCARDS',
         transcript: transcriptRes.fullText,
         segments: transcriptRes.segments,
         videoTitle: meta.title,
         channel: meta.channel,
-        cardCount,
+        cardCount: count,
       });
 
       if (!flashcardRes.success || !flashcardRes.flashcards) {
@@ -193,8 +195,15 @@ export default function GenerateView({ currentVideo, onSaved }: Props) {
               Number of flashcards
             </label>
             <select
-              value={cardCount}
-              onChange={(e) => setCardCount(Number(e.target.value))}
+              value={isCustomCount ? 'custom' : cardCount}
+              onChange={(e) => {
+                if (e.target.value === 'custom') {
+                  setIsCustomCount(true);
+                } else {
+                  setIsCustomCount(false);
+                  setCardCount(Number(e.target.value));
+                }
+              }}
               className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
             >
               {[5, 8, 10, 15, 20].map((n) => (
@@ -202,7 +211,28 @@ export default function GenerateView({ currentVideo, onSaved }: Props) {
                   {n} cards
                 </option>
               ))}
+              <option value="custom">Custom…</option>
             </select>
+            {isCustomCount && (
+              <input
+                type="number"
+                min={1}
+                max={50}
+                value={cardCount || ''}
+                onChange={(e) => setCardCount(Number(e.target.value))}
+                onBlur={(e) =>
+                  setCardCount(
+                    Math.max(
+                      1,
+                      Math.min(50, Math.round(Number(e.target.value)) || 1)
+                    )
+                  )
+                }
+                placeholder="Enter a number (1–50)"
+                autoFocus
+                className="mt-2 w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+            )}
           </div>
 
           <button

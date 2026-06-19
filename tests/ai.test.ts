@@ -1,6 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { generateFlashcards, checkChromeAIAvailability } from '@/lib/ai';
-import type { TranscriptSegment } from '@/lib/types';
+import {
+  generateFlashcards,
+  checkChromeAIAvailability,
+  chunkTranscript,
+  distributeCounts,
+  finalizeCards,
+} from '@/lib/ai';
+import type { GeneratedFlashcard, TranscriptSegment } from '@/lib/types';
 
 describe('AI Flashcard Generation', () => {
   beforeEach(() => {
@@ -184,6 +190,87 @@ describe('AI Flashcard Generation', () => {
       }
     });
 
+    it('handles unpunctuated auto-generated captions without collapsing into one card', async () => {
+      // YouTube ASR captions arrive as short, lower-case, unpunctuated chunks.
+      const asrWords = (
+        'spaced repetition is a learning technique that uses increasing intervals ' +
+        'between reviews to fight the forgetting curve discovered by ebbinghaus without ' +
+        'review people forget most of what they learn within a day active recall is far ' +
+        'more effective than passive reading the testing effect is one of the most robust ' +
+        'findings in cognitive science fsrs is a modern scheduling algorithm trained on ' +
+        'hundreds of millions of reviews it achieves far fewer reviews than the older sm ' +
+        'two algorithm the key insight is that memory decays exponentially so you should ' +
+        'review right at the point of forgetting for the best long term retention'
+      ).split(/\s+/);
+
+      const asrSegments: TranscriptSegment[] = [];
+      for (let i = 0; i < asrWords.length; i += 2) {
+        asrSegments.push({
+          text: asrWords.slice(i, i + 2).join(' '),
+          start: i * 1.5,
+          duration: 3,
+        });
+      }
+      const transcript = asrSegments.map((s) => s.text).join(' ');
+
+      const { flashcards } = await generateFlashcards(
+        transcript,
+        'Learning Science',
+        'Ch',
+        5,
+        asrSegments
+      );
+
+      // Must produce several distinct cards, not one giant blob.
+      expect(flashcards.length).toBeGreaterThan(1);
+      // Answers should be bite-sized, never the entire transcript.
+      for (const card of flashcards) {
+        expect(card.answer.length).toBeLessThan(transcript.length);
+        expect(card.answer.split(/\s+/).length).toBeLessThanOrEqual(30);
+      }
+      // Timestamps should be spread across the video, not all stuck at 0.
+      const uniqueTimestamps = new Set(flashcards.map((c) => c.timestamp));
+      expect(uniqueTimestamps.size).toBeGreaterThan(1);
+    });
+
+    it('builds cloze (fill-in-the-blank) cards for factual sentences', async () => {
+      const factSegments: TranscriptSegment[] = [
+        {
+          text: 'The marathon distance measures exactly 42 kilometers in total.',
+          start: 5,
+          duration: 4,
+        },
+        {
+          text: 'Runners usually train for many months before attempting one.',
+          start: 30,
+          duration: 4,
+        },
+        {
+          text: 'Proper hydration plays a major role during the race itself.',
+          start: 60,
+          duration: 4,
+        },
+      ];
+      const transcript = factSegments.map((s) => s.text).join(' ');
+
+      const { flashcards } = await generateFlashcards(
+        transcript,
+        'Running',
+        'Ch',
+        3,
+        factSegments
+      );
+
+      const cloze = flashcards.find((c) =>
+        c.question.startsWith('Fill in the blank:')
+      );
+      expect(cloze).toBeDefined();
+      expect(cloze!.question).toContain('_____');
+      expect(cloze!.answer).toContain('42');
+      // The blanked term must not be given away in the question.
+      expect(cloze!.question).not.toContain(cloze!.answer);
+    });
+
     it('handles very short transcripts', async () => {
       const shortSegments: TranscriptSegment[] = [
         { text: 'This is a short but important video about testing.', start: 0, duration: 5 },
@@ -202,7 +289,110 @@ describe('AI Flashcard Generation', () => {
     });
   });
 
+  describe('Long-video coverage helpers', () => {
+    describe('chunkTranscript', () => {
+      it('returns a single chunk for short transcripts', () => {
+        expect(chunkTranscript('a short transcript', 6000)).toEqual([
+          'a short transcript',
+        ]);
+      });
+
+      it('covers the whole transcript contiguously when it fits in maxChunks', () => {
+        const words = Array.from({ length: 2000 }, (_, i) => `w${i}`);
+        const text = words.join(' '); // ~10k+ chars
+        const chunks = chunkTranscript(text, 6000, 6);
+
+        expect(chunks.length).toBeGreaterThan(1);
+        expect(chunks.length).toBeLessThanOrEqual(6);
+        chunks.forEach((c) => expect(c.length).toBeLessThanOrEqual(6000));
+        // Coverage reaches both the first and the last word of the video.
+        expect(chunks[0]).toContain('w0 ');
+        expect(chunks[chunks.length - 1]).toContain('w1999');
+      });
+
+      it('samples evenly and stays within maxChunks for very long transcripts', () => {
+        const words = Array.from({ length: 40000 }, (_, i) => `w${i}`);
+        const text = words.join(' '); // far more than 6 * 6000 chars
+        const chunks = chunkTranscript(text, 6000, 6);
+
+        expect(chunks.length).toBe(6);
+        chunks.forEach((c) => expect(c.length).toBeLessThanOrEqual(6000));
+        // Still reaches the start and end of the video.
+        expect(chunks[0]).toContain('w0 ');
+        expect(chunks[chunks.length - 1]).toContain('w39999');
+      });
+    });
+
+    describe('distributeCounts', () => {
+      it('sums to the total and spreads evenly', () => {
+        expect(distributeCounts(10, 3)).toEqual([4, 3, 3]);
+        expect(distributeCounts(12, 6)).toEqual([2, 2, 2, 2, 2, 2]);
+      });
+
+      it('spreads a small remainder across non-adjacent buckets', () => {
+        const counts = distributeCounts(3, 6);
+        expect(counts.reduce((a, b) => a + b, 0)).toBe(3);
+        expect(counts).toEqual([1, 0, 1, 0, 1, 0]);
+      });
+
+      it('handles edge cases', () => {
+        expect(distributeCounts(5, 1)).toEqual([5]);
+        expect(distributeCounts(0, 3)).toEqual([0, 0, 0]);
+        expect(distributeCounts(4, 0)).toEqual([]);
+      });
+    });
+  });
+
   describe('Chrome AI generation', () => {
+    it('chunks long transcripts and merges cards across the whole video', async () => {
+      const longTranscript = Array.from({ length: 3000 }, (_, i) => `w${i}`).join(
+        ' '
+      ); // ~16k chars → multiple chunks
+
+      let call = 0;
+      const mockSession = {
+        prompt: vi.fn().mockImplementation(() => {
+          call++;
+          return Promise.resolve(
+            JSON.stringify([
+              {
+                question: `Q${call}a?`,
+                answer: 'A',
+                timestamp: call * 10,
+                topic: 'T',
+              },
+              {
+                question: `Q${call}b?`,
+                answer: 'A',
+                timestamp: call * 10 + 1,
+                topic: 'T',
+              },
+            ])
+          );
+        }),
+        destroy: vi.fn(),
+      };
+      const create = vi.fn().mockResolvedValue(mockSession);
+      (globalThis as Record<string, unknown>).LanguageModel = {
+        availability: vi.fn().mockResolvedValue('available'),
+        create,
+      };
+
+      const { flashcards, backend } = await generateFlashcards(
+        longTranscript,
+        'Long Video',
+        'Ch',
+        6,
+        []
+      );
+
+      expect(backend).toBe('chrome-ai');
+      // More than one AI call means more than the first ~10 minutes was covered.
+      expect(create.mock.calls.length).toBeGreaterThan(1);
+      expect(flashcards.length).toBe(6);
+    });
+
+
     it('uses Chrome AI when available and falls back on failure', async () => {
       const mockSession = {
         prompt: vi.fn().mockRejectedValue(new Error('AI failed')),
@@ -279,5 +469,42 @@ describe('AI Flashcard Generation', () => {
       expect(backend).toBe('chrome-ai');
       expect(flashcards).toHaveLength(1);
     });
+  });
+});
+
+describe('finalizeCards (quality pass)', () => {
+  it('drops empty and self-answering cards', () => {
+    const cards: GeneratedFlashcard[] = [
+      { question: 'What is X?', answer: 'X is a useful thing.', timestamp: 5, topic: '' },
+      { question: '', answer: 'no question here', timestamp: 1, topic: '' },
+      { question: 'Echo', answer: 'Echo', timestamp: 2, topic: '' },
+    ];
+    const out = finalizeCards(cards, 10);
+    expect(out).toHaveLength(1);
+    expect(out[0].question).toBe('What is X?');
+  });
+
+  it('removes near-duplicate questions', () => {
+    const cards: GeneratedFlashcard[] = [
+      { question: 'What is spaced repetition technique', answer: 'a study method', timestamp: 1, topic: '' },
+      { question: 'What is spaced repetition technique really', answer: 'a study method', timestamp: 2, topic: '' },
+      { question: 'What is the forgetting curve', answer: 'memory decay over time', timestamp: 3, topic: '' },
+    ];
+    const out = finalizeCards(cards, 10);
+    expect(out).toHaveLength(2);
+  });
+
+  it('caps to the requested count and sorts by timestamp', () => {
+    const cards: GeneratedFlashcard[] = Array.from({ length: 8 }, (_, i) => ({
+      question: `Question number ${i}?`,
+      answer: `Answer ${i} with enough words here`,
+      timestamp: (8 - i) * 10, // descending, so finalize must re-sort
+      topic: '',
+    }));
+    const out = finalizeCards(cards, 4);
+    expect(out).toHaveLength(4);
+    for (let i = 1; i < out.length; i++) {
+      expect(out[i].timestamp).toBeGreaterThanOrEqual(out[i - 1].timestamp);
+    }
   });
 });
