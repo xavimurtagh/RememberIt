@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { generateFlashcards, checkChromeAIAvailability } from '@/lib/ai';
+import {
+  generateFlashcards,
+  checkChromeAIAvailability,
+  chunkTranscript,
+  distributeCounts,
+} from '@/lib/ai';
 import type { TranscriptSegment } from '@/lib/types';
 
 describe('AI Flashcard Generation', () => {
@@ -245,7 +250,110 @@ describe('AI Flashcard Generation', () => {
     });
   });
 
+  describe('Long-video coverage helpers', () => {
+    describe('chunkTranscript', () => {
+      it('returns a single chunk for short transcripts', () => {
+        expect(chunkTranscript('a short transcript', 6000)).toEqual([
+          'a short transcript',
+        ]);
+      });
+
+      it('covers the whole transcript contiguously when it fits in maxChunks', () => {
+        const words = Array.from({ length: 2000 }, (_, i) => `w${i}`);
+        const text = words.join(' '); // ~10k+ chars
+        const chunks = chunkTranscript(text, 6000, 6);
+
+        expect(chunks.length).toBeGreaterThan(1);
+        expect(chunks.length).toBeLessThanOrEqual(6);
+        chunks.forEach((c) => expect(c.length).toBeLessThanOrEqual(6000));
+        // Coverage reaches both the first and the last word of the video.
+        expect(chunks[0]).toContain('w0 ');
+        expect(chunks[chunks.length - 1]).toContain('w1999');
+      });
+
+      it('samples evenly and stays within maxChunks for very long transcripts', () => {
+        const words = Array.from({ length: 40000 }, (_, i) => `w${i}`);
+        const text = words.join(' '); // far more than 6 * 6000 chars
+        const chunks = chunkTranscript(text, 6000, 6);
+
+        expect(chunks.length).toBe(6);
+        chunks.forEach((c) => expect(c.length).toBeLessThanOrEqual(6000));
+        // Still reaches the start and end of the video.
+        expect(chunks[0]).toContain('w0 ');
+        expect(chunks[chunks.length - 1]).toContain('w39999');
+      });
+    });
+
+    describe('distributeCounts', () => {
+      it('sums to the total and spreads evenly', () => {
+        expect(distributeCounts(10, 3)).toEqual([4, 3, 3]);
+        expect(distributeCounts(12, 6)).toEqual([2, 2, 2, 2, 2, 2]);
+      });
+
+      it('spreads a small remainder across non-adjacent buckets', () => {
+        const counts = distributeCounts(3, 6);
+        expect(counts.reduce((a, b) => a + b, 0)).toBe(3);
+        expect(counts).toEqual([1, 0, 1, 0, 1, 0]);
+      });
+
+      it('handles edge cases', () => {
+        expect(distributeCounts(5, 1)).toEqual([5]);
+        expect(distributeCounts(0, 3)).toEqual([0, 0, 0]);
+        expect(distributeCounts(4, 0)).toEqual([]);
+      });
+    });
+  });
+
   describe('Chrome AI generation', () => {
+    it('chunks long transcripts and merges cards across the whole video', async () => {
+      const longTranscript = Array.from({ length: 3000 }, (_, i) => `w${i}`).join(
+        ' '
+      ); // ~16k chars → multiple chunks
+
+      let call = 0;
+      const mockSession = {
+        prompt: vi.fn().mockImplementation(() => {
+          call++;
+          return Promise.resolve(
+            JSON.stringify([
+              {
+                question: `Q${call}a?`,
+                answer: 'A',
+                timestamp: call * 10,
+                topic: 'T',
+              },
+              {
+                question: `Q${call}b?`,
+                answer: 'A',
+                timestamp: call * 10 + 1,
+                topic: 'T',
+              },
+            ])
+          );
+        }),
+        destroy: vi.fn(),
+      };
+      const create = vi.fn().mockResolvedValue(mockSession);
+      (globalThis as Record<string, unknown>).LanguageModel = {
+        availability: vi.fn().mockResolvedValue('available'),
+        create,
+      };
+
+      const { flashcards, backend } = await generateFlashcards(
+        longTranscript,
+        'Long Video',
+        'Ch',
+        6,
+        []
+      );
+
+      expect(backend).toBe('chrome-ai');
+      // More than one AI call means more than the first ~10 minutes was covered.
+      expect(create.mock.calls.length).toBeGreaterThan(1);
+      expect(flashcards.length).toBe(6);
+    });
+
+
     it('uses Chrome AI when available and falls back on failure', async () => {
       const mockSession = {
         prompt: vi.fn().mockRejectedValue(new Error('AI failed')),

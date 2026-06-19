@@ -1,8 +1,69 @@
 import type { GeneratedFlashcard, TranscriptSegment } from './types';
 
+// Per-chunk character budget. Kept small so each prompt fits the on-device
+// model's modest context window.
 const MAX_TRANSCRIPT_LENGTH = 6000;
+// Upper bound on AI calls per generation, so very long videos stay responsive.
+const MAX_AI_CHUNKS = 6;
 
 export type AIBackend = 'chrome-ai' | 'rule-based';
+
+/**
+ * Splits a transcript into windows that together cover the whole video while
+ * keeping each window within MAX_TRANSCRIPT_LENGTH (so it fits the on-device
+ * model). When the transcript is short enough to cover contiguously within
+ * MAX_AI_CHUNKS windows it does so; longer transcripts get up to MAX_AI_CHUNKS
+ * evenly-spaced windows so coverage still spans the entire video. Windows snap
+ * to word boundaries.
+ */
+export function chunkTranscript(
+  text: string,
+  budget = MAX_TRANSCRIPT_LENGTH,
+  maxChunks = MAX_AI_CHUNKS
+): string[] {
+  const clean = text.trim();
+  if (clean.length <= budget) return clean ? [clean] : [];
+
+  const count = Math.min(Math.ceil(clean.length / budget), maxChunks);
+  const step = (clean.length - budget) / (count - 1);
+
+  const chunks: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const window = wordWindow(clean, Math.round(i * step), budget);
+    if (window) chunks.push(window);
+  }
+  return chunks;
+}
+
+function wordWindow(text: string, start: number, budget: number): string {
+  let s = start;
+  if (s > 0) {
+    const sp = text.indexOf(' ', s);
+    if (sp !== -1 && sp - s < 80) s = sp + 1;
+  }
+  let end = Math.min(s + budget, text.length);
+  if (end < text.length) {
+    const sp = text.lastIndexOf(' ', end);
+    if (sp > s) end = sp;
+  }
+  return text.slice(s, end).trim();
+}
+
+/**
+ * Splits a total card count into `buckets` per-chunk counts that sum to the
+ * total, spreading any remainder across evenly-spaced buckets so coverage isn't
+ * front-loaded.
+ */
+export function distributeCounts(total: number, buckets: number): number[] {
+  if (buckets <= 0) return [];
+  const counts = new Array(buckets).fill(Math.floor(total / buckets));
+  let remainder = total % buckets;
+  if (remainder > 0) {
+    const stride = buckets / remainder;
+    for (let k = 0; k < remainder; k++) counts[Math.floor(k * stride)]++;
+  }
+  return counts;
+}
 
 export async function checkChromeAIAvailability(): Promise<boolean> {
   try {
@@ -47,8 +108,41 @@ async function generateWithChromeAI(
   channel: string,
   cardCount: number
 ): Promise<GeneratedFlashcard[]> {
-  const trimmed = transcript.slice(0, MAX_TRANSCRIPT_LENGTH);
+  const chunks = chunkTranscript(transcript);
+  const perChunk = distributeCounts(cardCount, chunks.length);
 
+  const collected: GeneratedFlashcard[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    if (perChunk[i] <= 0) continue;
+    try {
+      const cards = await generateChunkWithChromeAI(
+        chunks[i],
+        videoTitle,
+        channel,
+        perChunk[i],
+        i,
+        chunks.length
+      );
+      collected.push(...cards);
+    } catch {
+      // Skip this chunk; other chunks may still produce cards.
+    }
+  }
+
+  if (collected.length === 0) {
+    throw new Error('Chrome AI returned no cards');
+  }
+  return collected.slice(0, cardCount);
+}
+
+async function generateChunkWithChromeAI(
+  transcriptChunk: string,
+  videoTitle: string,
+  channel: string,
+  cardCount: number,
+  index: number,
+  total: number
+): Promise<GeneratedFlashcard[]> {
   const session = await LanguageModel.create({
     expectedOutputLanguages: ['en'],
     initialPrompts: [
@@ -59,12 +153,15 @@ async function generateWithChromeAI(
     ],
   });
 
-  const prompt = `Video: "${videoTitle}" by ${channel}
+  const sectionNote =
+    total > 1 ? ` (section ${index + 1} of ${total} of the video)` : '';
+
+  const prompt = `Video: "${videoTitle}" by ${channel}${sectionNote}
 
 Transcript:
-${trimmed}
+${transcriptChunk}
 
-Generate exactly ${cardCount} flashcards as a JSON array. Each should test understanding, be self-contained, include an approximate timestamp in seconds, and cover the most important concepts. Vary types: definitions, applications, comparisons, facts. Keep answers to 1-2 sentences.
+Generate exactly ${cardCount} flashcards as a JSON array. Each should test understanding, be self-contained, include an approximate timestamp in seconds, and cover the most important concepts in this transcript. Vary types: definitions, applications, comparisons, facts. Keep answers to 1-2 sentences.
 
 Return ONLY the JSON array:`;
 
