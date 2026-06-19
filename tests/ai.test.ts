@@ -184,6 +184,49 @@ describe('AI Flashcard Generation', () => {
       }
     });
 
+    it('handles unpunctuated auto-generated captions without collapsing into one card', async () => {
+      // YouTube ASR captions arrive as short, lower-case, unpunctuated chunks.
+      const asrWords = (
+        'spaced repetition is a learning technique that uses increasing intervals ' +
+        'between reviews to fight the forgetting curve discovered by ebbinghaus without ' +
+        'review people forget most of what they learn within a day active recall is far ' +
+        'more effective than passive reading the testing effect is one of the most robust ' +
+        'findings in cognitive science fsrs is a modern scheduling algorithm trained on ' +
+        'hundreds of millions of reviews it achieves far fewer reviews than the older sm ' +
+        'two algorithm the key insight is that memory decays exponentially so you should ' +
+        'review right at the point of forgetting for the best long term retention'
+      ).split(/\s+/);
+
+      const asrSegments: TranscriptSegment[] = [];
+      for (let i = 0; i < asrWords.length; i += 2) {
+        asrSegments.push({
+          text: asrWords.slice(i, i + 2).join(' '),
+          start: i * 1.5,
+          duration: 3,
+        });
+      }
+      const transcript = asrSegments.map((s) => s.text).join(' ');
+
+      const { flashcards } = await generateFlashcards(
+        transcript,
+        'Learning Science',
+        'Ch',
+        5,
+        asrSegments
+      );
+
+      // Must produce several distinct cards, not one giant blob.
+      expect(flashcards.length).toBeGreaterThan(1);
+      // Answers should be bite-sized, never the entire transcript.
+      for (const card of flashcards) {
+        expect(card.answer.length).toBeLessThan(transcript.length);
+        expect(card.answer.split(/\s+/).length).toBeLessThanOrEqual(30);
+      }
+      // Timestamps should be spread across the video, not all stuck at 0.
+      const uniqueTimestamps = new Set(flashcards.map((c) => c.timestamp));
+      expect(uniqueTimestamps.size).toBeGreaterThan(1);
+    });
+
     it('handles very short transcripts', async () => {
       const shortSegments: TranscriptSegment[] = [
         { text: 'This is a short but important video about testing.', start: 0, duration: 5 },

@@ -162,29 +162,53 @@ function scoreSentence(sentence: string): { score: number; topic: string } {
 function segmentsToSentences(
   segments: TranscriptSegment[]
 ): { text: string; timestamp: number }[] {
-  const fullText = segments
-    .map((s) => ({ text: s.text, ts: s.start }))
-    .reduce(
-      (acc, seg) => {
-        if (acc.length === 0) return [seg];
-        const last = acc[acc.length - 1];
-        if (!last.text.match(/[.!?]$/)) {
-          last.text += ' ' + seg.text;
-          return acc;
-        }
-        acc.push(seg);
-        return acc;
-      },
-      [] as { text: string; ts: number }[]
-    );
+  // Group caption segments into bite-sized units. We close a unit either at a
+  // real sentence boundary (.!? — for manually-punctuated captions) or once it
+  // reaches a word cap. The word cap is essential because YouTube's
+  // auto-generated captions have NO punctuation: without it every segment would
+  // merge into one giant run-on "sentence" stamped at time 0, yielding a single
+  // useless card. Each unit keeps the start time of its first segment.
+  const MIN_WORDS = 4;
+  const MAX_WORDS = 22;
 
+  const units: { text: string; timestamp: number }[] = [];
+  let text = '';
+  let start: number | null = null;
+  let words = 0;
+
+  const flush = () => {
+    const trimmed = text.trim();
+    if (trimmed.length > 0 && start !== null) {
+      units.push({ text: trimmed, timestamp: start });
+    }
+    text = '';
+    start = null;
+    words = 0;
+  };
+
+  for (const seg of segments) {
+    const piece = seg.text.trim();
+    if (!piece) continue;
+    if (start === null) start = seg.start;
+    text += (text ? ' ' : '') + piece;
+    words += piece.split(/\s+/).length;
+
+    const endsSentence = /[.!?]["')\]]?$/.test(text);
+    if ((endsSentence && words >= MIN_WORDS) || words >= MAX_WORDS) {
+      flush();
+    }
+  }
+  flush();
+
+  // Split any unit that still holds multiple punctuated sentences so each card
+  // targets a single idea.
   const sentences: { text: string; timestamp: number }[] = [];
-  for (const chunk of fullText) {
-    const parts = chunk.text.split(/(?<=[.!?])\s+/);
+  for (const unit of units) {
+    const parts = unit.text.split(/(?<=[.!?])\s+/);
     for (const part of parts) {
       const trimmed = part.trim();
       if (trimmed.length > 15) {
-        sentences.push({ text: trimmed, timestamp: chunk.ts });
+        sentences.push({ text: trimmed, timestamp: unit.timestamp });
       }
     }
   }
