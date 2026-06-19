@@ -4,8 +4,9 @@ import {
   checkChromeAIAvailability,
   chunkTranscript,
   distributeCounts,
+  finalizeCards,
 } from '@/lib/ai';
-import type { TranscriptSegment } from '@/lib/types';
+import type { GeneratedFlashcard, TranscriptSegment } from '@/lib/types';
 
 describe('AI Flashcard Generation', () => {
   beforeEach(() => {
@@ -232,6 +233,44 @@ describe('AI Flashcard Generation', () => {
       expect(uniqueTimestamps.size).toBeGreaterThan(1);
     });
 
+    it('builds cloze (fill-in-the-blank) cards for factual sentences', async () => {
+      const factSegments: TranscriptSegment[] = [
+        {
+          text: 'The marathon distance measures exactly 42 kilometers in total.',
+          start: 5,
+          duration: 4,
+        },
+        {
+          text: 'Runners usually train for many months before attempting one.',
+          start: 30,
+          duration: 4,
+        },
+        {
+          text: 'Proper hydration plays a major role during the race itself.',
+          start: 60,
+          duration: 4,
+        },
+      ];
+      const transcript = factSegments.map((s) => s.text).join(' ');
+
+      const { flashcards } = await generateFlashcards(
+        transcript,
+        'Running',
+        'Ch',
+        3,
+        factSegments
+      );
+
+      const cloze = flashcards.find((c) =>
+        c.question.startsWith('Fill in the blank:')
+      );
+      expect(cloze).toBeDefined();
+      expect(cloze!.question).toContain('_____');
+      expect(cloze!.answer).toContain('42');
+      // The blanked term must not be given away in the question.
+      expect(cloze!.question).not.toContain(cloze!.answer);
+    });
+
     it('handles very short transcripts', async () => {
       const shortSegments: TranscriptSegment[] = [
         { text: 'This is a short but important video about testing.', start: 0, duration: 5 },
@@ -430,5 +469,42 @@ describe('AI Flashcard Generation', () => {
       expect(backend).toBe('chrome-ai');
       expect(flashcards).toHaveLength(1);
     });
+  });
+});
+
+describe('finalizeCards (quality pass)', () => {
+  it('drops empty and self-answering cards', () => {
+    const cards: GeneratedFlashcard[] = [
+      { question: 'What is X?', answer: 'X is a useful thing.', timestamp: 5, topic: '' },
+      { question: '', answer: 'no question here', timestamp: 1, topic: '' },
+      { question: 'Echo', answer: 'Echo', timestamp: 2, topic: '' },
+    ];
+    const out = finalizeCards(cards, 10);
+    expect(out).toHaveLength(1);
+    expect(out[0].question).toBe('What is X?');
+  });
+
+  it('removes near-duplicate questions', () => {
+    const cards: GeneratedFlashcard[] = [
+      { question: 'What is spaced repetition technique', answer: 'a study method', timestamp: 1, topic: '' },
+      { question: 'What is spaced repetition technique really', answer: 'a study method', timestamp: 2, topic: '' },
+      { question: 'What is the forgetting curve', answer: 'memory decay over time', timestamp: 3, topic: '' },
+    ];
+    const out = finalizeCards(cards, 10);
+    expect(out).toHaveLength(2);
+  });
+
+  it('caps to the requested count and sorts by timestamp', () => {
+    const cards: GeneratedFlashcard[] = Array.from({ length: 8 }, (_, i) => ({
+      question: `Question number ${i}?`,
+      answer: `Answer ${i} with enough words here`,
+      timestamp: (8 - i) * 10, // descending, so finalize must re-sort
+      topic: '',
+    }));
+    const out = finalizeCards(cards, 4);
+    expect(out).toHaveLength(4);
+    for (let i = 1; i < out.length; i++) {
+      expect(out[i].timestamp).toBeGreaterThanOrEqual(out[i - 1].timestamp);
+    }
   });
 });

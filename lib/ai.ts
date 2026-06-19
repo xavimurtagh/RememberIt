@@ -86,20 +86,21 @@ export async function generateFlashcards(
 
   if (aiAvailable) {
     try {
-      const flashcards = await generateWithChromeAI(
+      const raw = await generateWithChromeAI(
         transcript,
         videoTitle,
         channel,
         cardCount
       );
-      return { flashcards, backend: 'chrome-ai' };
+      const flashcards = finalizeCards(raw, cardCount);
+      if (flashcards.length > 0) return { flashcards, backend: 'chrome-ai' };
     } catch {
       // Fall through to rule-based
     }
   }
 
-  const flashcards = generateWithRules(segments, videoTitle, cardCount);
-  return { flashcards, backend: 'rule-based' };
+  const raw = generateWithRules(segments, videoTitle, cardCount);
+  return { flashcards: finalizeCards(raw, cardCount), backend: 'rule-based' };
 }
 
 async function generateWithChromeAI(
@@ -132,7 +133,8 @@ async function generateWithChromeAI(
   if (collected.length === 0) {
     throw new Error('Chrome AI returned no cards');
   }
-  return collected.slice(0, cardCount);
+  // Trimming/dedup happens in finalizeCards so it has all candidates to work with.
+  return collected;
 }
 
 async function generateChunkWithChromeAI(
@@ -325,7 +327,10 @@ function makeDefinitionCard(sentence: string, timestamp: number, topic: string):
       topic: topic || subject.split(/\s+/).slice(0, 3).join(' '),
     };
   }
-  return makeGenericCard(sentence, timestamp, topic);
+  return (
+    makeClozeCard(sentence, timestamp, topic) ||
+    makeGenericCard(sentence, timestamp, topic)
+  );
 }
 
 function makeComparisonCard(sentence: string, timestamp: number, topic: string): GeneratedFlashcard {
@@ -338,15 +343,166 @@ function makeComparisonCard(sentence: string, timestamp: number, topic: string):
 }
 
 function makeGenericCard(sentence: string, timestamp: number, topic: string): GeneratedFlashcard {
-  const words = sentence.split(/\s+/);
-  const keyPhrase = words.slice(0, Math.min(6, words.length)).join(' ');
-
+  const subject = firstContentPhrase(sentence, 3);
   return {
-    question: `What key point is made about "${truncate(keyPhrase, 50)}"?`,
+    question: subject
+      ? `What does the video say about ${subject}?`
+      : `Recall the key point: "${truncate(sentence, 80)}"`,
     answer: sentence,
     timestamp,
-    topic: topic || words.slice(0, 3).join(' '),
+    topic: topic || subject,
   };
+}
+
+/**
+ * Builds a cloze (fill-in-the-blank) card by blanking the most salient term in
+ * a sentence — a number/quantity, a proper noun, or the most specific content
+ * word. Returns null when no good blank exists, so the caller can fall back to
+ * another card style. Cloze cards make far better recall prompts than the
+ * generic "what key point is made about…" template.
+ */
+function makeClozeCard(
+  sentence: string,
+  timestamp: number,
+  topic: string
+): GeneratedFlashcard | null {
+  const term = pickClozeTerm(sentence);
+  if (!term) return null;
+
+  const pattern = new RegExp(`\\b${escapeRegExp(term)}\\b`);
+  if (!pattern.test(sentence)) return null;
+  const blanked = sentence.replace(pattern, '_____');
+  if (blanked === sentence || !blanked.includes('_____')) return null;
+
+  return {
+    question: `Fill in the blank: ${blanked}`,
+    answer: term,
+    timestamp,
+    topic: topic || deriveTopic(sentence),
+  };
+}
+
+function pickClozeTerm(sentence: string): string | null {
+  // 1. A number or quantity makes the cleanest, least-ambiguous blank.
+  const num = sentence.match(
+    /\b\d[\d,.]*(?:\s?(?:%|percent|million|billion|thousand|years?|hours?|minutes?|seconds?|days?|weeks?|months?|km|kilometers?|miles?|dollars?))?/i
+  );
+  if (num && num[0].trim().length >= 1) return num[0].trim();
+
+  // 2. A proper noun or acronym (capitalised, but not the first word).
+  const tokens = sentence.split(/\s+/);
+  for (let i = 1; i < tokens.length; i++) {
+    const w = tokens[i].replace(/[^A-Za-z'-]/g, '');
+    if (/^[A-Z][a-z]{2,}$/.test(w) && !STOPWORDS.has(w.toLowerCase())) return w;
+    if (/^[A-Z]{2,6}$/.test(w)) return w;
+  }
+
+  // 3. The most specific content word (longest non-stopword).
+  let best = '';
+  for (const raw of tokens) {
+    const w = raw.replace(/[^A-Za-z'-]/g, '');
+    if (w.length < 7 || STOPWORDS.has(w.toLowerCase())) continue;
+    if (w.length > best.length) best = w;
+  }
+  return best || null;
+}
+
+function firstContentPhrase(sentence: string, maxWords: number): string {
+  const words = sentence
+    .replace(/[^A-Za-z0-9'\s-]/g, '')
+    .split(/\s+/)
+    .filter((w) => w.length > 0 && !STOPWORDS.has(w.toLowerCase()));
+  return words.slice(0, maxWords).join(' ');
+}
+
+function deriveTopic(sentence: string): string {
+  const proper = sentence.match(/\b[A-Z][a-z]{2,}\b/);
+  if (proper) return proper[0];
+  return firstContentPhrase(sentence, 2);
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ── Quality pass (filter, dedupe, exact count) ──────────────────────
+
+const STOPWORDS = new Set(
+  (
+    'the a an and or but if then else than that this these those of to in on at ' +
+    'for with as is are was were be been being it its they them their there here ' +
+    'he she we you i his her our your my me us do does did have has had will would ' +
+    'can could should may might must not no so such very more most some any all ' +
+    'each every which who whom whose what when where why how about into over under ' +
+    'again once also just only because therefore however from by'
+  ).split(/\s+/)
+);
+
+function normalizeText(text: string): string {
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function tokenSet(text: string): Set<string> {
+  return new Set(normalizeText(text).split(/\s+/).filter(Boolean));
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let intersection = 0;
+  for (const token of a) if (b.has(token)) intersection++;
+  return intersection / (a.size + b.size - intersection);
+}
+
+/** Drops empty, self-answering, or runaway cards. */
+function isUsableCard(card: GeneratedFlashcard): boolean {
+  const q = (card.question || '').trim();
+  const a = (card.answer || '').trim();
+  if (!q || !a) return false;
+  if (!/[a-z0-9]/i.test(q) || !/[a-z0-9]/i.test(a)) return false;
+  if (normalizeText(q) === normalizeText(a)) return false;
+  if (a.split(/\s+/).length > 80) return false;
+  return true;
+}
+
+/** Removes cards whose question is (near-)identical to one already kept. */
+function dedupeCards(cards: GeneratedFlashcard[]): GeneratedFlashcard[] {
+  const kept: GeneratedFlashcard[] = [];
+  const keptQuestionTokens: Set<string>[] = [];
+  const keptAnswers = new Set<string>();
+
+  for (const card of cards) {
+    const qNorm = normalizeText(card.question);
+    const qTokens = tokenSet(card.question);
+    const aNorm = normalizeText(card.answer);
+    const answerSubstantial = card.answer.trim().split(/\s+/).length >= 4;
+
+    const duplicate =
+      kept.some((k) => normalizeText(k.question) === qNorm) ||
+      keptQuestionTokens.some((tokens) => jaccard(tokens, qTokens) >= 0.82) ||
+      (answerSubstantial && keptAnswers.has(aNorm));
+
+    if (duplicate) continue;
+
+    kept.push(card);
+    keptQuestionTokens.push(qTokens);
+    if (answerSubstantial) keptAnswers.add(aNorm);
+  }
+  return kept;
+}
+
+/**
+ * Final quality pass applied to every backend: drop degenerate cards, remove
+ * near-duplicates, cap to the requested count (keeping the highest-priority
+ * cards, which are listed first), then order by position in the video.
+ */
+export function finalizeCards(
+  cards: GeneratedFlashcard[],
+  cardCount: number
+): GeneratedFlashcard[] {
+  const deduped = dedupeCards(cards.filter(isUsableCard));
+  const limited =
+    deduped.length > cardCount ? deduped.slice(0, cardCount) : deduped;
+  return limited.sort((a, b) => a.timestamp - b.timestamp);
 }
 
 function truncate(text: string, maxLen: number): string {
@@ -368,6 +524,14 @@ function generateWithRules(
 
   scored.sort((a, b) => b.score - a.score);
 
+  // Over-generate candidates (best-scored first) so the quality pass can drop
+  // duplicates/low-value cards and still reach the requested count. Ordering is
+  // left by score; finalizeCards trims then sorts by timestamp.
+  const target = Math.min(
+    scored.length,
+    Math.max(cardCount + 3, Math.ceil(cardCount * 1.5))
+  );
+
   const selected: ScoredSentence[] = [];
   const usedTimestamps = new Set<number>();
 
@@ -376,26 +540,29 @@ function generateWithRules(
   const minSpacing = Math.max(5, totalDuration / (cardCount * 2));
 
   for (const s of scored) {
-    if (selected.length >= cardCount) break;
+    if (selected.length >= target) break;
 
     const nearbyUsed = [...usedTimestamps].some(
       (t) => Math.abs(t - s.timestamp) < minSpacing
     );
-    if (nearbyUsed && selected.length > cardCount / 2) continue;
+    if (nearbyUsed && selected.length > target / 2) continue;
 
     selected.push(s);
     usedTimestamps.add(s.timestamp);
   }
 
-  selected.sort((a, b) => a.timestamp - b.timestamp);
+  return selected.map((s) => toRuleBasedCard(s));
+}
 
-  return selected.map((s) => {
-    if (DEFINITION_PATTERNS.some((p) => p.test(s.text))) {
-      return makeDefinitionCard(s.text, s.timestamp, s.topic);
-    }
-    if (/\b(?:however|but|although|in\s+contrast|unlike)\b/i.test(s.text)) {
-      return makeComparisonCard(s.text, s.timestamp, s.topic);
-    }
-    return makeGenericCard(s.text, s.timestamp, s.topic);
-  });
+function toRuleBasedCard(s: ScoredSentence): GeneratedFlashcard {
+  if (DEFINITION_PATTERNS.some((p) => p.test(s.text))) {
+    return makeDefinitionCard(s.text, s.timestamp, s.topic);
+  }
+  if (/\b(?:however|but|although|in\s+contrast|unlike)\b/i.test(s.text)) {
+    return makeComparisonCard(s.text, s.timestamp, s.topic);
+  }
+  return (
+    makeClozeCard(s.text, s.timestamp, s.topic) ||
+    makeGenericCard(s.text, s.timestamp, s.topic)
+  );
 }
